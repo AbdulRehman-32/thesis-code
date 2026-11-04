@@ -1,0 +1,26 @@
+# Raw datasets and generated artifacts
+/data/
+/outputs/
+/reports/
+
+# Old workflow
+/main.py
+
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Model files and local databases
+*.pth
+*.pt
+*.pkl
+*.joblib
+*.sqlite
+*.sqlite3
