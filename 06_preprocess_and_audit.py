@@ -54,6 +54,13 @@ CICIDS_EXCLUDED_COLUMNS = {
     "Timestamp",
 }
 
+# Columns that describe the label/attack annotation rather than measurable
+# network-flow behaviour. They must never be used as model predictors.
+ANNOTATION_EXCLUDED_COLUMNS = {
+    "difficulty",
+    "Attempted Category",
+}
+
 LABEL_COLUMNS = {
     "NSL-KDD": "label",
     "CICIDS2017": "Label",
@@ -199,12 +206,29 @@ def normalize_labels(df: pd.DataFrame, dataset: str) -> pd.DataFrame:
 
 def identify_columns(train: pd.DataFrame, dataset: str):
     label_col = LABEL_COLUMNS[dataset]
-    exclude = NON_FEATURE_COLUMNS | {label_col, "binary_target"}
+
+    exclude = (
+        NON_FEATURE_COLUMNS
+        | ANNOTATION_EXCLUDED_COLUMNS
+        | {label_col, "binary_target"}
+    )
 
     if dataset == "CICIDS2017":
         exclude = exclude | CICIDS_EXCLUDED_COLUMNS
 
     feature_columns = [c for c in train.columns if c not in exclude]
+
+    # Explicit leakage guard: these annotation fields must never enter the
+    # predictor schema, even if their names or capitalisation change.
+    forbidden_present = sorted(
+        set(feature_columns).intersection(ANNOTATION_EXCLUDED_COLUMNS)
+    )
+    if forbidden_present:
+        fail(
+            f"{dataset}: annotation/leakage columns remain in predictors: "
+            f"{forbidden_present}"
+        )
+
     numeric_columns = []
     categorical_columns = []
 
@@ -687,6 +711,9 @@ def main() -> None:
                         "numeric_columns": numeric_columns,
                         "categorical_columns": categorical_columns,
                         "ordered_model_input_features": feature_names,
+                        "excluded_annotation_columns": sorted(
+                            ANNOTATION_EXCLUDED_COLUMNS
+                        ),
                     },
                     f,
                     indent=2,
@@ -698,6 +725,9 @@ def main() -> None:
                 "feature_columns": feature_columns,
                 "numeric_columns": numeric_columns,
                 "categorical_columns": categorical_columns,
+                "excluded_annotation_columns": sorted(
+                    ANNOTATION_EXCLUDED_COLUMNS
+                ),
                 "model_input_feature_count": len(feature_names),
                 "records": {
                     partition: {
@@ -730,7 +760,7 @@ def main() -> None:
             transformed_labels[dataset],
         )
 
-        unexpected_collisions = False
+    unexpected_collisions = False
 
     for dataset, audit in collision_audit.items():
         for partition, counts in audit["within_partition_duplicate_groups"].items():
@@ -766,6 +796,7 @@ def main() -> None:
             "unknown_category_policy": UNKNOWN_CATEGORY_POLICY,
             "max_abs_numeric_value": MAX_ABS_NUMERIC_VALUE,
             "cicids_excluded_columns": sorted(CICIDS_EXCLUDED_COLUMNS),
+            "annotation_excluded_columns": sorted(ANNOTATION_EXCLUDED_COLUMNS),
         },
         "datasets": partition_outputs,
         "preprocessing_exclusions": all_exclusions,
@@ -794,6 +825,10 @@ def main() -> None:
         dataset = item["dataset"]
         print(f"\n{dataset}")
         print(f"  Model-input features: {item['model_input_feature_count']}")
+        print(
+            f"  Excluded annotation columns: "
+            f"{item['excluded_annotation_columns']}"
+        )
 
         for partition, stats in item["records"].items():
             print(

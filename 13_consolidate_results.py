@@ -14,9 +14,12 @@ Usage:
   python 13_consolidate_results.py
 """
 
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,6 +30,17 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+PROJECT_ROOT = Path(r"E:\Thesis")
+
+PREPROCESSING_ROOT = PROJECT_ROOT / "reports" / "preprocessing"
+BASELINE_ROOT = PROJECT_ROOT / "reports" / "baselines"
+ADVERSARIAL_ROOT = PROJECT_ROOT / "reports" / "adversarial_training"
+DISTILLATION_ROOT = PROJECT_ROOT / "reports" / "distillation"
+FGSM_ROOT = PROJECT_ROOT / "reports" / "fgsm_evaluation"
+JSMA_ROOT = PROJECT_ROOT / "reports" / "jsma_evaluation"
+CW_ROOT = PROJECT_ROOT / "reports" / "cw_evaluation"
+OUTPUT_ROOT = PROJECT_ROOT / "reports" / "final_results"
+
 SEED = 42
 
 DATASETS = {
@@ -35,6 +49,8 @@ DATASETS = {
 }
 
 MODEL_LABELS = {
+    "logistic_regression": "Logistic Regression",
+    "random_forest": "Random Forest",
     "baseline_dnn": "Baseline DNN",
     "adversarially_trained_dnn": "Adversarially Trained DNN",
     "distilled_dnn": "Defensive Distillation DNN",
@@ -57,48 +73,216 @@ METRIC_COLUMNS = [
     "roc_auc",
 ]
 
+BASELINE_ONLY_MODELS = {"logistic_regression", "random_forest"}
+DNN_MODELS = {
+    "baseline_dnn",
+    "adversarially_trained_dnn",
+    "distilled_dnn",
+}
 
-def utc_now():
+
+def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def timestamp():
-    return utc_now().strftime("%Y%m%dT%H%M%S_%f")[:-3] + "Z"
+def timestamp() -> str:
+    return utc_now().strftime("%Y%m%dT%H%M%S_%fZ")
 
 
-def sha256_file(path):
+def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
-    with open(path, "rb") as f:
+    with path.open("rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
 
 
-def latest_folder(root, prefix):
-    root = Path(root)
-    folders = [
-        path for path in root.glob(f"{prefix}_*")
-        if path.is_dir()
-    ]
+def fail(message: str) -> None:
+    print(f"[FAIL] {message}")
+    sys.exit(1)
 
-    if not folders:
-        raise FileNotFoundError(
-            f"No folder starting with {prefix}_ found under {root}"
+
+def log(message: str) -> None:
+    print(f"[INFO] {message}")
+
+
+def load_json(path: Path) -> dict:
+    if not path.exists():
+        fail(f"Required file not found: {path}")
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def resolve_preprocessing_dir(explicit_dir: str | None) -> Path:
+    if explicit_dir:
+        selected = Path(explicit_dir)
+        if not selected.is_absolute():
+            selected = PROJECT_ROOT / selected
+    else:
+        candidates = sorted(
+            [p for p in PREPROCESSING_ROOT.glob("preprocessing_*") if p.is_dir()],
+            key=lambda p: p.name,
+        )
+        if not candidates:
+            fail(f"No preprocessing folders found under: {PREPROCESSING_ROOT}")
+        selected = candidates[-1]
+
+    report = load_json(selected / "preprocessing_report.json")
+
+    if not report.get("preprocessing_completed", False):
+        fail(f"Selected preprocessing folder is not completed: {selected}")
+
+    excluded = set(
+        report.get("configuration", {}).get("annotation_excluded_columns", [])
+    )
+
+    if excluded != {"difficulty", "Attempted Category"}:
+        fail(
+            "Selected preprocessing output does not exclude required annotation "
+            f"columns.\nFolder: {selected}\nExcluded: {sorted(excluded)}"
         )
 
-    return max(folders, key=lambda path: path.name)
+    log(f"Using preprocessing output: {selected}")
+    return selected
 
 
-def load_metrics_csv(folder, filename):
-    path = Path(folder) / filename
+def resolve_latest_folder(
+    root: Path,
+    prefix: str,
+    report_filename: str,
+    completed_key: str,
+) -> Path:
+    candidates = sorted(
+        [p for p in root.glob(f"{prefix}_*") if p.is_dir()],
+        key=lambda p: p.name,
+    )
+
+    if not candidates:
+        fail(f"No {prefix} folders found under: {root}")
+
+    selected = candidates[-1]
+    report = load_json(selected / report_filename)
+
+    if not report.get(completed_key, False):
+        fail(f"Selected {prefix} folder is not completed: {selected}")
+
+    log(f"Using {prefix} output: {selected}")
+    return selected
+
+
+def verify_chain(
+    preprocessing_dir: Path,
+    preprocessing_hash: str | None,
+    baseline_dir: Path,
+    adversarial_dir: Path,
+    distillation_dir: Path,
+    fgsm_dir: Path,
+    jsma_dir: Path,
+    cw_dir: Path,
+) -> None:
+    baseline_report = load_json(baseline_dir / "baseline_results.json")
+    adversarial_report = load_json(
+        adversarial_dir / "adversarial_training_results.json"
+    )
+    distillation_report = load_json(
+        distillation_dir / "distillation_results.json"
+    )
+    fgsm_report = load_json(fgsm_dir / "fgsm_evaluation_results.json")
+    jsma_report = load_json(jsma_dir / "jsma_evaluation_results.json")
+    cw_report = load_json(cw_dir / "cw_evaluation_results.json")
+
+    if baseline_report.get("preprocessing_dir") != str(preprocessing_dir):
+        fail("Baseline folder was not trained on the selected preprocessing folder.")
+
+    if adversarial_report.get("preprocessing_dir") != str(preprocessing_dir):
+        fail(
+            "Adversarial-training folder was not trained on the selected "
+            "preprocessing folder."
+        )
+
+    if distillation_report.get("config", {}).get(
+        "preprocessing_dir"
+    ) != str(preprocessing_dir):
+        fail(
+            "Distillation folder was not trained on the selected preprocessing "
+            "folder."
+        )
+
+    for label, report in [
+        ("FGSM", fgsm_report),
+        ("JSMA", jsma_report),
+        ("CW-L2", cw_report),
+    ]:
+        if report.get("config", {}).get(
+            "preprocessing_dir"
+        ) != str(preprocessing_dir):
+            fail(
+                f"{label} evaluation folder was not evaluated on the selected "
+                "preprocessing folder."
+            )
+
+    if adversarial_report.get("baseline_dir") != str(baseline_dir):
+        fail("Adversarial-training folder does not match the selected baseline folder.")
+
+    if distillation_report.get("config", {}).get(
+        "baseline_dir"
+    ) != str(baseline_dir):
+        fail("Distillation folder does not match the selected baseline folder.")
+
+    for label, report in [
+        ("FGSM", fgsm_report),
+        ("JSMA", jsma_report),
+        ("CW-L2", cw_report),
+    ]:
+        if report.get("config", {}).get("baseline_dir") != str(baseline_dir):
+            fail(f"{label} evaluation folder does not match the selected baseline folder.")
+
+    if preprocessing_hash:
+        expected_hash = preprocessing_hash
+
+        if baseline_report.get("preprocessing_report_sha256") != expected_hash:
+            fail("Baseline preprocessing hash does not match selected preprocessing.")
+
+        if adversarial_report.get(
+            "preprocessing_report_sha256"
+        ) != expected_hash:
+            fail(
+                "Adversarial-training preprocessing hash does not match selected "
+                "preprocessing."
+            )
+
+        if distillation_report.get("config", {}).get(
+            "preprocessing_report_sha256"
+        ) != expected_hash:
+            fail(
+                "Distillation preprocessing hash does not match selected "
+                "preprocessing."
+            )
+
+        for label, report in [
+            ("FGSM", fgsm_report),
+            ("JSMA", jsma_report),
+            ("CW-L2", cw_report),
+        ]:
+            if report.get("config", {}).get(
+                "preprocessing_report_sha256"
+            ) != expected_hash:
+                fail(
+                    f"{label} evaluation preprocessing hash does not match selected "
+                    "preprocessing."
+                )
+
+
+def load_metrics_csv(folder: Path, filename: str) -> pd.DataFrame:
+    path = folder / filename
 
     if not path.exists():
-        raise FileNotFoundError(f"Missing required file: {path}")
+        fail(f"Missing required file: {path}")
 
     return pd.read_csv(path)
 
 
-def standardize_attack_results(df, attack_name):
+def standardize_attack_results(df: pd.DataFrame, attack_name: str) -> pd.DataFrame:
     df = df.copy()
 
     required = [
@@ -111,27 +295,13 @@ def standardize_attack_results(df, attack_name):
 
     missing = [column for column in required if column not in df.columns]
     if missing:
-        raise ValueError(
-            f"{attack_name} metrics file is missing columns: {missing}"
-        )
+        fail(f"{attack_name} metrics file is missing columns: {missing}")
 
-    # Clean rows have attack = "none".
-    # They must be labelled as "none", not as FGSM/JSMA/CW-L2.
-    df.loc[
+    df["attack_type"] = np.where(
         df["attack"].astype(str).str.lower() == "none",
-        "attack_type",
-    ] = "none"
-
-    # Attacked rows keep their actual attack name.
-    attacked = df["attack"].astype(str).str.lower() != "none"
-
-    df.loc[
-        attacked,
-        "attack_type",
-    ] = df.loc[
-        attacked,
-        "attack",
-    ]
+        "none",
+        attack_name,
+    )
 
     if "epsilon" not in df.columns:
         df["epsilon"] = np.nan
@@ -163,16 +333,18 @@ def standardize_attack_results(df, attack_name):
     return df[columns]
 
 
-def load_clean_baselines(baseline_dir):
-    path = Path(baseline_dir) / "baseline_metrics.csv"
+def load_classical_baselines(baseline_dir: Path) -> pd.DataFrame:
+    path = baseline_dir / "baseline_metrics.csv"
 
     if not path.exists():
-        raise FileNotFoundError(f"Missing baseline metrics file: {path}")
+        fail(f"Missing baseline metrics file: {path}")
 
     df = pd.read_csv(path)
 
     if "split" in df.columns:
         df = df[df["split"].str.lower() == "test"]
+
+    df = df[df["model"].isin(BASELINE_ONLY_MODELS)].copy()
 
     df["attack_type"] = "none"
     df["attack"] = "none"
@@ -200,13 +372,13 @@ def load_clean_baselines(baseline_dir):
 
 
 def make_combined_results(
-    baseline_df,
-    fgsm_df,
-    jsma_df,
-    cw_df,
-):
+    classical_baseline_df: pd.DataFrame,
+    fgsm_df: pd.DataFrame,
+    jsma_df: pd.DataFrame,
+    cw_df: pd.DataFrame,
+) -> pd.DataFrame:
     combined = pd.concat(
-        [baseline_df, fgsm_df, jsma_df, cw_df],
+        [classical_baseline_df, fgsm_df, jsma_df, cw_df],
         ignore_index=True,
     )
 
@@ -228,7 +400,13 @@ def make_combined_results(
     return combined
 
 
-def save_figure(df, metric, title, ylabel, output_path):
+def save_fgsm_figure(
+    df: pd.DataFrame,
+    metric: str,
+    title: str,
+    ylabel: str,
+    output_path: Path,
+) -> None:
     plt.figure(figsize=(10, 6))
 
     for dataset_label, dataset_group in df.groupby("dataset_label"):
@@ -253,27 +431,18 @@ def save_figure(df, metric, title, ylabel, output_path):
 
 
 def create_attack_bar_figure(
-    combined,
-    attack_type,
-    metric,
-    figure_number,
-    title,
-    ylabel,
-    output_dir,
-):
+    combined: pd.DataFrame,
+    attack_type: str,
+    metric: str,
+    figure_number: str,
+    title: str,
+    ylabel: str,
+    output_dir: Path,
+) -> None:
     attack_df = combined[
-        combined["attack_type"].isin(["none", attack_type])
+        (combined["attack_type"].isin(["none", attack_type]))
+        & (combined["model"].isin(DNN_MODELS))
     ].copy()
-
-    attack_df = attack_df[
-        attack_df["model"].isin(
-            [
-                "baseline_dnn",
-                "adversarially_trained_dnn",
-                "distilled_dnn",
-            ]
-        )
-    ]
 
     if attack_df.empty:
         return
@@ -336,14 +505,14 @@ def create_attack_bar_figure(
     plt.close()
 
 
-def create_figures(combined, output_dir):
+def create_figures(combined: pd.DataFrame, output_dir: Path) -> None:
     fgsm = combined[
         (combined["attack_type"] == "FGSM")
         & combined["epsilon"].notna()
     ].copy()
 
     if not fgsm.empty:
-        save_figure(
+        save_fgsm_figure(
             fgsm,
             "accuracy",
             "Figure 4.1: FGSM Accuracy vs Epsilon",
@@ -351,7 +520,7 @@ def create_figures(combined, output_dir):
             output_dir / "figure_4_1_fgsm_accuracy.png",
         )
 
-        save_figure(
+        save_fgsm_figure(
             fgsm,
             "roc_auc",
             "Figure 4.2: FGSM ROC-AUC vs Epsilon",
@@ -400,94 +569,184 @@ def create_figures(combined, output_dir):
     )
 
 
-def main():
-    parser = argparse.ArgumentParser()
+def write_workbook(
+    output_dir: Path,
+    combined: pd.DataFrame,
+    clean_results: pd.DataFrame,
+    fgsm_results: pd.DataFrame,
+    jsma_results: pd.DataFrame,
+    cw_results: pd.DataFrame,
+    source_folders: dict,
+    artifact_hashes: dict[str, str],
+) -> Path:
+    excel_path = output_dir / "Thesis_Final_Results.xlsx"
+
+    with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+        combined.to_excel(writer, sheet_name="Combined Results", index=False)
+        clean_results.to_excel(writer, sheet_name="Clean Results", index=False)
+        fgsm_results.to_excel(writer, sheet_name="FGSM Results", index=False)
+        jsma_results.to_excel(writer, sheet_name="JSMA Results", index=False)
+        cw_results.to_excel(writer, sheet_name="CW Results", index=False)
+
+        pd.DataFrame(
+            [
+                {"source": source, "folder": folder}
+                for source, folder in source_folders.items()
+            ]
+        ).to_excel(writer, sheet_name="Provenance", index=False)
+
+        pd.DataFrame(
+            [
+                {"artifact": artifact, "sha256": digest}
+                for artifact, digest in artifact_hashes.items()
+            ]
+        ).to_excel(writer, sheet_name="Artifact Hashes", index=False)
+
+    return excel_path
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Script 13: final thesis results consolidation"
+    )
     parser.add_argument(
         "--preprocessing-dir",
-        default=r"E:\Thesis\reports\preprocessing\preprocessing_20261104T040755_364187Z",
+        type=str,
+        default=None,
+        help="Optional specific 06 preprocessing output folder",
     )
     parser.add_argument(
         "--baseline-dir",
-        default=r"E:\Thesis\reports\baselines\baselines_20261104T043514_850585Z",
+        type=str,
+        default=None,
+        help="Optional specific 07 baseline output folder",
     )
     parser.add_argument(
         "--adversarial-dir",
-        default=r"E:\Thesis\reports\adversarial_training\adversarial_training_20261104T051559_260516Z",
+        type=str,
+        default=None,
+        help="Optional specific 08 adversarial-training output folder",
     )
     parser.add_argument(
         "--distillation-dir",
-        default=r"E:\Thesis\reports\distillation\distillation_20261104T070817_076Z",
+        type=str,
+        default=None,
+        help="Optional specific 09 distillation output folder",
     )
     parser.add_argument(
         "--fgsm-dir",
+        type=str,
         default=None,
-        help="Final FGSM evaluation folder",
+        help="Optional specific 10 FGSM evaluation output folder",
     )
     parser.add_argument(
         "--jsma-dir",
+        type=str,
         default=None,
-        help="Final JSMA evaluation folder",
+        help="Optional specific 11 JSMA evaluation output folder",
     )
     parser.add_argument(
         "--cw-dir",
+        type=str,
         default=None,
-        help="Final CW evaluation folder",
-    )
-    parser.add_argument(
-        "--output-root",
-        default=r"E:\Thesis\reports\final_results",
+        help="Optional specific 12 CW evaluation output folder",
     )
     args = parser.parse_args()
 
-    preprocessing_dir = Path(args.preprocessing_dir)
-    baseline_dir = Path(args.baseline_dir)
-    adversarial_dir = Path(args.adversarial_dir)
-    distillation_dir = Path(args.distillation_dir)
+    started_utc = utc_now().isoformat()
+    log("Starting 13_consolidate_results")
+
+    preprocessing_dir = resolve_preprocessing_dir(args.preprocessing_dir)
+    preprocessing_report = load_json(
+        preprocessing_dir / "preprocessing_report.json"
+    )
+    preprocessing_hash = preprocessing_report.get("preprocessing_report_sha256")
+
+    if not preprocessing_hash:
+        fail("Preprocessing report does not contain preprocessing_report_sha256.")
+
+    baseline_dir = (
+        Path(args.baseline_dir)
+        if args.baseline_dir
+        else resolve_latest_folder(
+            BASELINE_ROOT,
+            "baselines",
+            "baseline_results.json",
+            "baselines_completed",
+        )
+    )
+
+    adversarial_dir = (
+        Path(args.adversarial_dir)
+        if args.adversarial_dir
+        else resolve_latest_folder(
+            ADVERSARIAL_ROOT,
+            "adversarial_training",
+            "adversarial_training_results.json",
+            "adversarial_training_completed",
+        )
+    )
+
+    distillation_dir = (
+        Path(args.distillation_dir)
+        if args.distillation_dir
+        else resolve_latest_folder(
+            DISTILLATION_ROOT,
+            "distillation",
+            "distillation_results.json",
+            "distillation_completed",
+        )
+    )
 
     fgsm_dir = (
         Path(args.fgsm_dir)
         if args.fgsm_dir
-        else latest_folder(
-            r"E:\Thesis\reports\fgsm_evaluation",
+        else resolve_latest_folder(
+            FGSM_ROOT,
             "fgsm_evaluation",
+            "fgsm_evaluation_results.json",
+            "fgsm_evaluation_completed",
         )
     )
 
     jsma_dir = (
         Path(args.jsma_dir)
         if args.jsma_dir
-        else latest_folder(
-            r"E:\Thesis\reports\jsma_evaluation",
+        else resolve_latest_folder(
+            JSMA_ROOT,
             "jsma_evaluation",
+            "jsma_evaluation_results.json",
+            "jsma_evaluation_completed",
         )
     )
 
     cw_dir = (
         Path(args.cw_dir)
         if args.cw_dir
-        else latest_folder(
-            r"E:\Thesis\reports\cw_evaluation",
+        else resolve_latest_folder(
+            CW_ROOT,
             "cw_evaluation",
+            "cw_evaluation_results.json",
+            "cw_evaluation_completed",
         )
     )
 
+    verify_chain(
+        preprocessing_dir,
+        preprocessing_hash,
+        baseline_dir,
+        adversarial_dir,
+        distillation_dir,
+        fgsm_dir,
+        jsma_dir,
+        cw_dir,
+    )
+
     run_id = timestamp()
-    output_dir = Path(args.output_root) / f"final_results_{run_id}"
+    output_dir = OUTPUT_ROOT / f"final_results_{run_id}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("=" * 70)
-    print("SCRIPT 13: FINAL RESULTS CONSOLIDATION")
-    print("=" * 70)
-    print(f"Preprocessing folder: {preprocessing_dir}")
-    print(f"Baseline folder: {baseline_dir}")
-    print(f"Adversarial-training folder: {adversarial_dir}")
-    print(f"Distillation folder: {distillation_dir}")
-    print(f"FGSM folder: {fgsm_dir}")
-    print(f"JSMA folder: {jsma_dir}")
-    print(f"CW folder: {cw_dir}")
-    print(f"Output folder: {output_dir}")
-
-    baseline_df = load_clean_baselines(baseline_dir)
+    classical_baseline_df = load_classical_baselines(baseline_dir)
 
     fgsm_df = standardize_attack_results(
         load_metrics_csv(fgsm_dir, "fgsm_evaluation_metrics.csv"),
@@ -505,52 +764,25 @@ def main():
     )
 
     combined = make_combined_results(
-        baseline_df,
+        classical_baseline_df,
         fgsm_df,
         jsma_df,
         cw_df,
     )
 
-    combined.to_csv(
-        output_dir / "combined_thesis_results.csv",
-        index=False,
-    )
+    combined.to_csv(output_dir / "combined_thesis_results.csv", index=False)
 
-    clean_results = combined[
-        combined["attack_type"] == "none"
-    ].copy()
+    clean_results = combined[combined["attack_type"] == "none"].copy()
+    clean_results.to_csv(output_dir / "table_4_1_clean_results.csv", index=False)
 
-    clean_results.to_csv(
-        output_dir / "table_4_1_clean_results.csv",
-        index=False,
-    )
+    fgsm_results = combined[combined["attack_type"] == "FGSM"].copy()
+    fgsm_results.to_csv(output_dir / "table_4_2_fgsm_results.csv", index=False)
 
-    fgsm_results = combined[
-        combined["attack_type"] == "FGSM"
-    ].copy()
+    jsma_results = combined[combined["attack_type"] == "JSMA"].copy()
+    jsma_results.to_csv(output_dir / "table_4_3_jsma_results.csv", index=False)
 
-    fgsm_results.to_csv(
-        output_dir / "table_4_2_fgsm_results.csv",
-        index=False,
-    )
-
-    jsma_results = combined[
-        combined["attack_type"] == "JSMA"
-    ].copy()
-
-    jsma_results.to_csv(
-        output_dir / "table_4_3_jsma_results.csv",
-        index=False,
-    )
-
-    cw_results = combined[
-        combined["attack_type"] == "CW-L2"
-    ].copy()
-
-    cw_results.to_csv(
-        output_dir / "table_4_4_cw_results.csv",
-        index=False,
-    )
+    cw_results = combined[combined["attack_type"] == "CW-L2"].copy()
+    cw_results.to_csv(output_dir / "table_4_4_cw_results.csv", index=False)
 
     create_figures(combined, output_dir)
 
@@ -565,13 +797,15 @@ def main():
     }
 
     provenance = {
+        "script": "13_consolidate_results",
         "run_id": run_id,
+        "started_utc": started_utc,
         "created_utc": utc_now().isoformat(),
         "source_folders": source_folders,
         "seed": SEED,
     }
 
-    with open(output_dir / "provenance.json", "w", encoding="utf-8") as f:
+    with (output_dir / "provenance.json").open("w", encoding="utf-8") as f:
         json.dump(provenance, f, indent=2)
 
     artifact_hashes = {}
@@ -580,70 +814,66 @@ def main():
         if path.is_file():
             artifact_hashes[str(path.relative_to(output_dir))] = sha256_file(path)
 
-    with open(output_dir / "artifact_hashes.json", "w", encoding="utf-8") as f:
+    with (output_dir / "artifact_hashes.json").open("w", encoding="utf-8") as f:
         json.dump(artifact_hashes, f, indent=2)
 
-    excel_path = output_dir / "Thesis_Final_Results.xlsx"
+    excel_path = write_workbook(
+        output_dir=output_dir,
+        combined=combined,
+        clean_results=clean_results,
+        fgsm_results=fgsm_results,
+        jsma_results=jsma_results,
+        cw_results=cw_results,
+        source_folders=source_folders,
+        artifact_hashes=artifact_hashes,
+    )
+    log(f"Wrote final results workbook: {excel_path}")
 
-    with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-        combined.to_excel(
-            writer,
-            sheet_name="Combined Results",
-            index=False,
-        )
+    final_report = {
+        "script": "13_consolidate_results",
+        "started_utc": started_utc,
+        "finished_utc": utc_now().isoformat(),
+        "source_folders": source_folders,
+        "combined_result_rows": int(len(combined)),
+        "artifact_hashes": artifact_hashes,
+        "excel_workbook": str(excel_path),
+        "consolidation_completed": True,
+    }
 
-        clean_results.to_excel(
-            writer,
-            sheet_name="Clean Results",
-            index=False,
-        )
+    with (output_dir / "final_results_report.json").open(
+        "w", encoding="utf-8"
+    ) as f:
+        json.dump(final_report, f, indent=2)
 
-        fgsm_results.to_excel(
-            writer,
-            sheet_name="FGSM Results",
-            index=False,
-        )
+    report_hash = sha256_file(output_dir / "final_results_report.json")
+    final_report["final_results_report_sha256"] = report_hash
 
-        jsma_results.to_excel(
-            writer,
-            sheet_name="JSMA Results",
-            index=False,
-        )
+    with (output_dir / "final_results_report.json").open(
+        "w", encoding="utf-8"
+    ) as f:
+        json.dump(final_report, f, indent=2)
 
-        cw_results.to_excel(
-            writer,
-            sheet_name="CW Results",
-            index=False,
-        )
+    print("\n============ 13 FINAL RESULTS CONSOLIDATION ============")
 
-        pd.DataFrame(
-            [
-                {"source": source, "folder": folder}
-                for source, folder in source_folders.items()
+    for dataset in DATASETS:
+        dataset_rows = combined[combined["dataset"] == dataset]
+
+        print(f"\n{dataset}")
+        print(f"  Combined rows: {len(dataset_rows)}")
+
+        for attack_type in ["none", "FGSM", "JSMA", "CW-L2"]:
+            attack_rows = dataset_rows[
+                dataset_rows["attack_type"] == attack_type
             ]
-        ).to_excel(
-            writer,
-            sheet_name="Provenance",
-            index=False,
-        )
 
-        pd.DataFrame(
-            [
-                {"artifact": artifact, "sha256": digest}
-                for artifact, digest in artifact_hashes.items()
-            ]
-        ).to_excel(
-            writer,
-            sheet_name="Artifact Hashes",
-            index=False,
-        )
+            if not attack_rows.empty:
+                print(f"  {attack_type}: {len(attack_rows)} rows")
 
-    print("\n" + "=" * 70)
-    print("FINAL RESULTS CONSOLIDATION COMPLETE")
-    print("=" * 70)
-    print(f"Combined results rows: {len(combined)}")
-    print(f"Saved outputs: {output_dir}")
-    print("\nDone.")
+    print("\n========================================================")
+    print("[PASS] 13_consolidate_results completed successfully.")
+    print(f"Combined results: {output_dir / 'combined_thesis_results.csv'}")
+    print(f"Excel workbook: {excel_path}")
+    print(f"Output folder: {output_dir}")
 
 
 if __name__ == "__main__":

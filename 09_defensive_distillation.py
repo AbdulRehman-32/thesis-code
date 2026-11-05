@@ -4,16 +4,20 @@ r"""
 Defensive distillation for the thesis IDS pipeline.
 
 Uses:
-  E:\Thesis\reports\preprocessing\preprocessing_20261104T040755_364187Z
-  E:\Thesis\reports\baselines\baselines_20261104T043514_850585Z
+  - The latest valid leakage-free 06_preprocess_and_audit output.
+  - The latest valid 07_train_baselines output.
+  - The clean baseline DNN checkpoint as the distillation teacher.
 
 Outputs:
   E:\Thesis\reports\distillation\distillation_<timestamp>\
 """
 
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,533 +36,787 @@ from sklearn.metrics import (
 )
 from torch.utils.data import DataLoader, TensorDataset
 
+PROJECT_ROOT = Path(r"E:\Thesis")
+
+PREPROCESSING_ROOT = PROJECT_ROOT / "reports" / "preprocessing"
+BASELINE_ROOT = PROJECT_ROOT / "reports" / "baselines"
+OUTPUT_ROOT = PROJECT_ROOT / "reports" / "distillation"
+
 SEED = 42
 TEMPERATURE = 20.0
-EPOCHS_TEACHER = 40
 EPOCHS_STUDENT = 40
 BATCH_SIZE = 512
 LEARNING_RATE = 0.001
 WEIGHT_DECAY = 1e-5
 PATIENCE = 5
-HIDDEN_DIM = 128
-DROPOUT = 0.3
+HIDDEN_DIMS = (256, 128, 64)
+DROPOUT = 0.2
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-DATASETS = {
-    "NSL-KDD": "nsl_kdd",
-    "CICIDS2017": "cicids2017",
-}
+DATASETS = ["NSL-KDD", "CICIDS2017"]
+REQUIRED_ANNOTATION_EXCLUSIONS = {"difficulty", "Attempted Category"}
 
 
-def utc_now():
+def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def timestamp():
-    return utc_now().strftime("%Y%m%dT%H%M%S_%f")[:-3] + "Z"
+def timestamp() -> str:
+    return utc_now().strftime("%Y%m%dT%H%M%S_%fZ")
 
 
-def sha256_file(path):
+def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
-    with open(path, "rb") as f:
+    with path.open("rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
 
 
-def set_seed(seed=SEED):
+def fail(message: str) -> None:
+    print(f"[FAIL] {message}")
+    sys.exit(1)
+
+
+def log(message: str) -> None:
+    print(f"[INFO] {message}")
+
+
+def load_json(path: Path) -> dict:
+    if not path.exists():
+        fail(f"Required file not found: {path}")
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def set_seed(seed: int = SEED) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
-class DNN(nn.Module):
-    def __init__(self, input_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, HIDDEN_DIM),
-            nn.ReLU(),
-            nn.Dropout(DROPOUT),
-            nn.Linear(HIDDEN_DIM, HIDDEN_DIM),
-            nn.ReLU(),
-            nn.Dropout(DROPOUT),
-            nn.Linear(HIDDEN_DIM, 2),
+def get_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def resolve_preprocessing_dir(explicit_dir: str | None) -> Path:
+    if explicit_dir:
+        selected = Path(explicit_dir)
+        if not selected.is_absolute():
+            selected = PROJECT_ROOT / selected
+    else:
+        candidates = sorted(
+            [p for p in PREPROCESSING_ROOT.glob("preprocessing_*") if p.is_dir()],
+            key=lambda p: p.name,
+        )
+        if not candidates:
+            fail(f"No preprocessing folders found under: {PREPROCESSING_ROOT}")
+        selected = candidates[-1]
+
+    report = load_json(selected / "preprocessing_report.json")
+
+    if not report.get("preprocessing_completed", False):
+        fail(f"Selected preprocessing folder is not completed: {selected}")
+
+    if not report.get("ready_for_model_training", False):
+        fail(f"Selected preprocessing folder is not ready for training: {selected}")
+
+    excluded = set(
+        report.get("configuration", {}).get("annotation_excluded_columns", [])
+    )
+
+    if excluded != REQUIRED_ANNOTATION_EXCLUSIONS:
+        fail(
+            "Selected preprocessing output does not exclude required annotation "
+            f"columns.\nFolder: {selected}\nExcluded: {sorted(excluded)}"
         )
 
-    def forward(self, x):
-        return self.net(x)
+    log(f"Using preprocessing output: {selected}")
+    return selected
 
 
-def load_split(dataset_dir, split):
-    X = np.load(dataset_dir / f"X_{split}.npy")
-    y = np.load(dataset_dir / f"y_{split}.npy")
-    return X, y
+def resolve_baseline_dir(
+    explicit_dir: str | None,
+    preprocessing_dir: Path,
+    preprocessing_hash: str | None,
+) -> Path:
+    if explicit_dir:
+        selected = Path(explicit_dir)
+        if not selected.is_absolute():
+            selected = PROJECT_ROOT / selected
+    else:
+        candidates = sorted(
+            [p for p in BASELINE_ROOT.glob("baselines_*") if p.is_dir()],
+            key=lambda p: p.name,
+        )
+        if not candidates:
+            fail(f"No baseline folders found under: {BASELINE_ROOT}")
+        selected = candidates[-1]
 
+    report_path = selected / "baseline_results.json"
+    if not report_path.exists():
+        fail(f"Selected baseline folder has no results report: {report_path}")
 
-def make_loader(X, y, shuffle=False):
-    ds = TensorDataset(
-        torch.tensor(X, dtype=torch.float32),
-        torch.tensor(y, dtype=torch.long),
-    )
+    report = load_json(report_path)
 
-    g = torch.Generator()
-    g.manual_seed(SEED)
+    if not report.get("baselines_completed", False):
+        fail(f"Selected baseline folder is not completed: {selected}")
 
-    return DataLoader(
-        ds,
-        batch_size=BATCH_SIZE,
-        shuffle=shuffle,
-        generator=g if shuffle else None,
-    )
-
-
-def train_teacher(X_train, y_train, X_val, y_val, input_dim):
-    model = DNN(input_dim).to(DEVICE)
-    optimizer = optim.Adam(
-        model.parameters(),
-        lr=LEARNING_RATE,
-        weight_decay=WEIGHT_DECAY,
-    )
-    criterion = nn.CrossEntropyLoss()
-
-    train_loader = make_loader(X_train, y_train, shuffle=True)
-    val_loader = make_loader(X_val, y_val, shuffle=False)
-
-    best_auc = -np.inf
-    best_state = None
-    best_epoch = 0
-    bad_epochs = 0
-
-    for epoch in range(1, EPOCHS_TEACHER + 1):
-        model.train()
-        total_loss = 0.0
-
-        for xb, yb in train_loader:
-            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-
-            optimizer.zero_grad()
-            logits = model(xb)
-            loss = criterion(logits, yb)
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item() * len(xb)
-
-        train_loss = total_loss / len(train_loader.dataset)
-
-        val_metrics, _, _ = evaluate(model, X_val, y_val)
-
-        print(
-            f"Teacher epoch {epoch:02d} | "
-            f"train loss {train_loss:.8f} | "
-            f"validation ROC-AUC {val_metrics['roc_auc']:.8f}"
+    if report.get("preprocessing_dir") != str(preprocessing_dir):
+        fail(
+            "Selected baseline folder was not trained on the selected "
+            "preprocessing output.\n"
+            f"Baseline preprocessing: {report.get('preprocessing_dir')}\n"
+            f"Selected preprocessing:  {preprocessing_dir}"
         )
 
-        if val_metrics["roc_auc"] > best_auc:
-            best_auc = val_metrics["roc_auc"]
-            best_epoch = epoch
-            best_state = {
-                k: v.detach().cpu().clone()
-                for k, v in model.state_dict().items()
-            }
-            bad_epochs = 0
-        else:
-            bad_epochs += 1
-            if bad_epochs >= PATIENCE:
-                print(f"Teacher early stopping at epoch {epoch}")
-                break
-
-    model.load_state_dict(best_state)
-
-    return model, {
-        "best_epoch": best_epoch,
-        "best_validation_roc_auc": float(best_auc),
-    }
-
-
-def generate_soft_labels(model, X):
-    model.eval()
-    loader = DataLoader(
-        TensorDataset(torch.tensor(X, dtype=torch.float32)),
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-    )
-
-    soft_labels = []
-
-    with torch.no_grad():
-        for (xb,) in loader:
-            logits = model(xb.to(DEVICE))
-
-            # Correct: soft targets must be probabilities.
-            probs = torch.softmax(logits / TEMPERATURE, dim=1)
-            soft_labels.append(probs.cpu())
-
-    return torch.cat(soft_labels)
-
-
-def train_student(X_train, y_train, soft_labels, X_val, y_val, input_dim):
-    model = DNN(input_dim).to(DEVICE)
-    optimizer = optim.Adam(
-        model.parameters(),
-        lr=LEARNING_RATE,
-        weight_decay=WEIGHT_DECAY,
-    )
-
-    train_ds = TensorDataset(
-        torch.tensor(X_train, dtype=torch.float32),
-        torch.tensor(y_train, dtype=torch.long),
-        soft_labels,
-    )
-    val_loader = make_loader(X_val, y_val, shuffle=False)
-
-    g = torch.Generator()
-    g.manual_seed(SEED)
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        generator=g,
-    )
-
-    ce_loss = nn.CrossEntropyLoss()
-    kl_loss = nn.KLDivLoss(reduction="batchmean")
-
-    best_auc = -np.inf
-    best_state = None
-    best_epoch = 0
-    bad_epochs = 0
-
-    for epoch in range(1, EPOCHS_STUDENT + 1):
-        model.train()
-        total_loss = 0.0
-
-        for xb, yb, soft in train_loader:
-            xb, yb, soft = xb.to(DEVICE), yb.to(DEVICE), soft.to(DEVICE)
-
-            optimizer.zero_grad()
-            logits = model(xb)
-
-            hard = ce_loss(logits, yb)
-            soft_loss = kl_loss(
-                nn.functional.log_softmax(logits / TEMPERATURE, dim=1),
-                soft,
-            ) * (TEMPERATURE ** 2)
-
-            loss = 0.5 * hard + 0.5 * soft_loss
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item() * len(xb)
-
-        train_loss = total_loss / len(train_loader.dataset)
-
-        val_metrics, _, _ = evaluate(model, X_val, y_val)
-
-        print(
-            f"Student epoch {epoch:02d} | "
-            f"train loss {train_loss:.8f} | "
-            f"validation ROC-AUC {val_metrics['roc_auc']:.8f}"
+    if (
+        preprocessing_hash
+        and report.get("preprocessing_report_sha256") != preprocessing_hash
+    ):
+        fail(
+            "Baseline preprocessing hash does not match the selected "
+            "preprocessing report hash."
         )
 
-        if val_metrics["roc_auc"] > best_auc:
-            best_auc = val_metrics["roc_auc"]
-            best_epoch = epoch
-            best_state = {
-                k: v.detach().cpu().clone()
-                for k, v in model.state_dict().items()
-            }
-            bad_epochs = 0
-        else:
-            bad_epochs += 1
-            if bad_epochs >= PATIENCE:
-                print(f"Student early stopping at epoch {epoch}")
-                break
-
-    model.load_state_dict(best_state)
-
-    return model, {
-        "best_epoch": best_epoch,
-        "best_validation_roc_auc": float(best_auc),
-    }
+    log(f"Using baseline output: {selected}")
+    return selected
 
 
-def evaluate(model, X, y):
-    model.eval()
-    loader = make_loader(X, y, shuffle=False)
+def compute_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_score: np.ndarray,
+) -> dict:
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
 
-    probs, preds, labels = [], [], []
-
-    with torch.no_grad():
-        for xb, yb in loader:
-            logits = model(xb.to(DEVICE))
-            prob = torch.softmax(logits, dim=1)[:, 1]
-            pred = torch.argmax(logits, dim=1)
-
-            probs.extend(prob.cpu().numpy())
-            preds.extend(pred.cpu().numpy())
-            labels.extend(yb.numpy())
-
-    probs = np.asarray(probs)
-    preds = np.asarray(preds)
-    labels = np.asarray(labels)
-
-    tn, fp, fn, tp = confusion_matrix(labels, preds, labels=[0, 1]).ravel()
-
-    metrics = {
-        "accuracy": float(accuracy_score(labels, preds)),
-        "precision": float(precision_score(labels, preds, zero_division=0)),
-        "recall": float(recall_score(labels, preds, zero_division=0)),
-        "f1": float(f1_score(labels, preds, zero_division=0)),
-        "false_negative_rate": float(fn / (tp + fn)) if (tp + fn) else 0.0,
-        "false_positive_rate": float(fp / (fp + tn)) if (fp + tn) else 0.0,
-        "roc_auc": float(roc_auc_score(labels, probs)),
+    return {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+        "specificity": float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0,
+        "false_positive_rate": float(fp / (fp + tn)) if (fp + tn) > 0 else 0.0,
+        "false_negative_rate": float(fn / (fn + tp)) if (fn + tp) > 0 else 0.0,
+        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+        "roc_auc": float(roc_auc_score(y_true, y_score)),
         "tp": int(tp),
         "fp": int(fp),
         "tn": int(tn),
         "fn": int(fn),
     }
 
-    return metrics, probs, preds
 
-
-def run_dataset(dataset_name, dataset_dir, output_dir):
-    print("\n" + "=" * 70)
-    print(f"DEFENSIVE DISTILLATION: {dataset_name}")
-    print("=" * 70)
-
-    X_train, y_train = load_split(dataset_dir, "train")
-    X_val, y_val = load_split(dataset_dir, "validation")
-    X_test, y_test = load_split(dataset_dir, "test")
-
-    print(f"Train: {X_train.shape}")
-    print(f"Validation: {X_val.shape}")
-    print(f"Test: {X_test.shape}")
-
-    input_dim = X_train.shape[1]
-
-    teacher, teacher_info = train_teacher(
-        X_train,
-        y_train,
-        X_val,
-        y_val,
-        input_dim,
+def format_metrics(metrics: dict) -> str:
+    return (
+        f"Accuracy:    {metrics['accuracy']:.8f}\n"
+        f"Precision:   {metrics['precision']:.8f}\n"
+        f"Recall:      {metrics['recall']:.8f}\n"
+        f"Specificity: {metrics['specificity']:.8f}\n"
+        f"FPR:         {metrics['false_positive_rate']:.8f}\n"
+        f"FNR:         {metrics['false_negative_rate']:.8f}\n"
+        f"F1-Score:    {metrics['f1']:.8f}\n"
+        f"ROC-AUC:     {metrics['roc_auc']:.8f}\n"
+        f"TP/FP/TN/FN: {metrics['tp']}/{metrics['fp']}/{metrics['tn']}/{metrics['fn']}"
     )
 
-    teacher_path = output_dir / f"{dataset_dir.name}_teacher_dnn.pt"
-    torch.save(teacher.state_dict(), teacher_path)
 
-    soft_labels = generate_soft_labels(teacher, X_train)
+class DistilledDNN(nn.Module):
+    def __init__(self, input_dim: int, hidden_dims: tuple[int, ...]):
+        super().__init__()
 
-    student, student_info = train_student(
-        X_train,
-        y_train,
-        soft_labels,
-        X_val,
-        y_val,
-        input_dim,
+        layers = []
+        previous = input_dim
+
+        for hidden in hidden_dims:
+            layers.extend(
+                [
+                    nn.Linear(previous, hidden),
+                    nn.ReLU(),
+                    nn.Dropout(DROPOUT),
+                ]
+            )
+            previous = hidden
+
+        layers.append(nn.Linear(previous, 1))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.network(x).squeeze(-1)
+
+
+def load_teacher(
+    checkpoint_path: Path,
+    expected_input_dim: int,
+    device: torch.device,
+) -> DistilledDNN:
+    if not checkpoint_path.exists():
+        fail(f"Clean baseline teacher checkpoint not found: {checkpoint_path}")
+
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=device,
+        weights_only=False,
     )
 
-    student_path = output_dir / f"{dataset_dir.name}_distilled_dnn.pt"
-    torch.save(student.state_dict(), student_path)
+    if int(checkpoint["input_dim"]) != expected_input_dim:
+        fail(
+            "Teacher checkpoint input dimension does not match preprocessing "
+            "features.\n"
+            f"Checkpoint input dim: {checkpoint['input_dim']}\n"
+            f"Expected input dim:   {expected_input_dim}\n"
+            f"Checkpoint: {checkpoint_path}"
+        )
 
-    val_metrics, val_probs, val_preds = evaluate(student, X_val, y_val)
-    test_metrics, test_probs, test_preds = evaluate(student, X_test, y_test)
+    model = DistilledDNN(
+        int(checkpoint["input_dim"]),
+        tuple(checkpoint["hidden_dims"]),
+    ).to(device)
 
-    np.savez_compressed(
-        output_dir / f"{dataset_dir.name}_distilled_validation_predictions.npz",
-        y_true=y_val,
-        y_prob=val_probs,
-        y_pred=val_preds,
+    model.load_state_dict(checkpoint["state_dict"])
+    model.eval()
+    return model
+
+
+def make_loader(
+    X: np.ndarray,
+    y: np.ndarray,
+    shuffle: bool = False,
+) -> DataLoader:
+    dataset = TensorDataset(
+        torch.tensor(X, dtype=torch.float32),
+        torch.tensor(y, dtype=torch.long),
     )
 
-    np.savez_compressed(
-        output_dir / f"{dataset_dir.name}_distilled_test_predictions.npz",
-        y_true=y_test,
-        y_prob=test_probs,
-        y_pred=test_preds,
+    generator = torch.Generator()
+    generator.manual_seed(SEED)
+
+    return DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=shuffle,
+        generator=generator if shuffle else None,
     )
 
+
+def generate_soft_targets(
+    teacher: DistilledDNN,
+    X: np.ndarray,
+    device: torch.device,
+) -> torch.Tensor:
+    teacher.eval()
+
+    dataset = TensorDataset(torch.tensor(X, dtype=torch.float32))
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+    soft_targets = []
+
+    with torch.no_grad():
+        for (xb,) in loader:
+            xb = xb.to(device)
+            logits = teacher(xb)
+
+            # Temperature-scaled teacher probability for the attack class.
+            probabilities = torch.sigmoid(logits / TEMPERATURE)
+            soft_targets.append(probabilities.detach().cpu())
+
+    return torch.cat(soft_targets)
+
+
+def train_student(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    soft_targets: torch.Tensor,
+    X_validation: np.ndarray,
+    y_validation: np.ndarray,
+    input_dim: int,
+    device: torch.device,
+    checkpoint_path: Path,
+) -> tuple[DistilledDNN, dict]:
+    set_seed(SEED)
+
+    X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+    y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
+
+    X_validation_tensor = torch.tensor(X_validation, dtype=torch.float32)
+    y_validation_tensor = torch.tensor(y_validation, dtype=torch.float32)
+
+    train_dataset = TensorDataset(
+        X_train_tensor,
+        y_train_tensor,
+        soft_targets,
+    )
+
+    generator = torch.Generator()
+    generator.manual_seed(SEED)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        generator=generator,
+    )
+
+    model = DistilledDNN(input_dim, HIDDEN_DIMS).to(device)
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
+    )
+    criterion = nn.BCEWithLogitsLoss(reduction="none")
+
+    best_validation_auc = -np.inf
+    best_epoch = 0
+    patience_counter = 0
+    best_state = None
+
+    for epoch in range(1, EPOCHS_STUDENT + 1):
+        model.train()
+        total_loss = 0.0
+
+        for xb, yb, soft in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            soft = soft.to(device)
+
+            optimizer.zero_grad()
+            logits = model(xb)
+
+            hard_loss = criterion(logits, yb)
+
+            # Binary temperature-scaled distillation loss:
+            # soft target p_T = sigmoid(teacher_logit / T)
+            # student probability p_S = sigmoid(student_logit / T)
+            student_prob = torch.sigmoid(logits / TEMPERATURE)
+            soft_loss = -(
+                soft * torch.log(student_prob + 1e-12)
+                + (1.0 - soft) * torch.log(1.0 - student_prob + 1e-12)
+            )
+
+            loss = 0.5 * hard_loss + 0.5 * (TEMPERATURE**2) * soft_loss
+            loss = loss.mean()
+
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item() * len(xb)
+
+        total_loss /= len(train_dataset)
+
+        model.eval()
+        with torch.no_grad():
+            validation_logits = model(X_validation_tensor.to(device))
+            validation_scores = torch.sigmoid(validation_logits).cpu().numpy()
+
+        validation_auc = roc_auc_score(y_validation, validation_scores)
+
+        if validation_auc > best_validation_auc:
+            best_validation_auc = validation_auc
+            best_epoch = epoch
+            patience_counter = 0
+            best_state = {
+                key: value.detach().cpu().clone()
+                for key, value in model.state_dict().items()
+            }
+        else:
+            patience_counter += 1
+
+        print(
+            f"  Student epoch {epoch:03d} | "
+            f"Distillation loss: {total_loss:.8f} | "
+            f"Validation AUC: {validation_auc:.8f}"
+        )
+
+        if patience_counter >= PATIENCE:
+            print(f"  Early stopping at epoch {epoch}.")
+            break
+
+    if best_state is None:
+        fail("Distilled student training did not produce a valid best state.")
+
+    model.load_state_dict(best_state)
+
+    torch.save(
+        {
+            "state_dict": model.state_dict(),
+            "input_dim": input_dim,
+            "hidden_dims": HIDDEN_DIMS,
+            "best_epoch": best_epoch,
+            "best_validation_auc": best_validation_auc,
+            "temperature": TEMPERATURE,
+            "random_state": SEED,
+        },
+        checkpoint_path,
+    )
+
+    history = {
+        "best_epoch": best_epoch,
+        "best_validation_auc": float(best_validation_auc),
+        "epochs_requested": EPOCHS_STUDENT,
+        "early_stopping_patience": PATIENCE,
+    }
+
+    return model, history
+
+
+def predict(
+    model: DistilledDNN,
+    X: np.ndarray,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray]:
+    model.eval()
+    X_tensor = torch.tensor(X, dtype=torch.float32).to(device)
+
+    with torch.no_grad():
+        logits = model(X_tensor)
+        scores = torch.sigmoid(logits).cpu().numpy()
+
+    predictions = (scores >= 0.5).astype(np.int8)
+    return predictions, scores
+
+
+def write_workbook(
+    output_dir: Path,
+    all_results: list[dict],
+    artifact_hashes: dict[str, str],
+    config: dict,
+) -> Path:
+    excel_path = output_dir / "Thesis_Distillation_Run_Record.xlsx"
+
+    run_rows = []
     metric_rows = []
 
-    for split, metrics in [
-        ("validation", val_metrics),
-        ("test", test_metrics),
-    ]:
-        metric_rows.append(
+    for result in all_results:
+        run_id = f"{result['dataset']}_distilled_DNN"
+
+        run_rows.append(
             {
-                "dataset": dataset_name,
-                "model": "distilled_dnn",
-                "split": split,
-                **metrics,
+                "Run ID": run_id,
+                "Dataset": result["dataset"],
+                "Model": "Defensively distilled DNN",
+                "Run Type": "Defensive distillation",
+                "Script": "09_defensive_distillation.py",
+                "Random Seed": SEED,
+                "Train Records": result["train_records"],
+                "Validation Records": result["validation_records"],
+                "Test Records": result["test_records"],
+                "Input Features": result["input_features"],
+                "Teacher Checkpoint": result["teacher_checkpoint"],
+                "Student Checkpoint": result["student_checkpoint"],
+                "Temperature": TEMPERATURE,
+                "Status": "Completed",
+                "Notes": "",
             }
         )
 
-    return {
-        "dataset": dataset_name,
-        "teacher": teacher_info,
-        "student": student_info,
-        "validation_metrics": val_metrics,
-        "test_metrics": test_metrics,
-        "teacher_checkpoint": teacher_path.name,
-        "student_checkpoint": student_path.name,
-        "metric_rows": metric_rows,
-    }
+        for split in ["validation_metrics", "test_metrics"]:
+            metric_rows.append(
+                {
+                    "Run ID": run_id,
+                    "Dataset": result["dataset"],
+                    "Model": "Defensively distilled DNN",
+                    "Split": split.replace("_metrics", ""),
+                    **result[split],
+                }
+            )
+
+    hash_rows = [
+        {"Artifact": artifact, "SHA-256": artifact_hash}
+        for artifact, artifact_hash in sorted(artifact_hashes.items())
+    ]
+
+    with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+        pd.DataFrame(run_rows).to_excel(writer, sheet_name="Run Index", index=False)
+        pd.DataFrame(metric_rows).to_excel(
+            writer, sheet_name="Distilled Metrics", index=False
+        )
+        pd.DataFrame([config]).to_excel(
+            writer, sheet_name="Run Configuration", index=False
+        )
+        pd.DataFrame(hash_rows).to_excel(
+            writer, sheet_name="Artifact Hashes", index=False
+        )
+
+    return excel_path
 
 
-def main():
-    parser = argparse.ArgumentParser()
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Script 09: defensive distillation from clean baseline DNNs"
+    )
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        default=DATASETS,
+        choices=DATASETS,
+        help="Datasets to distil",
+    )
     parser.add_argument(
         "--preprocessing-dir",
-        default=r"E:\Thesis\reports\preprocessing\preprocessing_20261104T040755_364187Z",
+        type=str,
+        default=None,
+        help="Optional specific 06 preprocessing output folder",
     )
     parser.add_argument(
         "--baseline-dir",
-        default=r"E:\Thesis\reports\baselines\baselines_20261104T043514_850585Z",
-    )
-    parser.add_argument(
-        "--output-root",
-        default=r"E:\Thesis\reports\distillation",
+        type=str,
+        default=None,
+        help="Optional specific 07 baseline output folder",
     )
     args = parser.parse_args()
 
-    set_seed()
+    started_utc = utc_now().isoformat()
+    log("Starting 09_defensive_distillation")
 
-    preprocessing_dir = Path(args.preprocessing_dir)
-    baseline_dir = Path(args.baseline_dir)
+    preprocessing_dir = resolve_preprocessing_dir(args.preprocessing_dir)
+    preprocessing_report = load_json(
+        preprocessing_dir / "preprocessing_report.json"
+    )
+    preprocessing_hash = preprocessing_report.get("preprocessing_report_sha256")
+
+    if not preprocessing_hash:
+        fail("Preprocessing report does not contain preprocessing_report_sha256.")
+
+    baseline_dir = resolve_baseline_dir(
+        args.baseline_dir,
+        preprocessing_dir,
+        preprocessing_hash,
+    )
 
     run_id = timestamp()
-    output_dir = Path(args.output_root) / f"distillation_{run_id}"
+    output_dir = OUTPUT_ROOT / f"distillation_{run_id}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("=" * 70)
-    print("SCRIPT 09: DEFENSIVE DISTILLATION")
-    print("=" * 70)
-    print(f"Device: {DEVICE}")
-    print(f"Preprocessing folder: {preprocessing_dir}")
-    print(f"Baseline folder: {baseline_dir}")
-    print(f"Output folder: {output_dir}")
+    device = get_device()
+    log(f"Using device: {device}")
 
     config = {
         "script": "09_defensive_distillation.py",
-        "run_id": run_id,
-        "created_utc": utc_now().isoformat(),
-        "device": str(DEVICE),
+        "started_utc": started_utc,
+        "device": str(device),
         "preprocessing_dir": str(preprocessing_dir),
+        "preprocessing_report_sha256": preprocessing_hash,
         "baseline_dir": str(baseline_dir),
         "temperature": TEMPERATURE,
-        "teacher_epochs": EPOCHS_TEACHER,
         "student_epochs": EPOCHS_STUDENT,
         "batch_size": BATCH_SIZE,
         "learning_rate": LEARNING_RATE,
         "weight_decay": WEIGHT_DECAY,
         "patience": PATIENCE,
-        "hidden_dim": HIDDEN_DIM,
+        "hidden_dims": list(HIDDEN_DIMS),
         "dropout": DROPOUT,
         "seed": SEED,
-        "loss": "0.5 * hard cross-entropy + 0.5 * temperature-scaled KL divergence",
+        "loss": (
+            "0.5 * binary cross-entropy + 0.5 * temperature-scaled "
+            "binary soft-target distillation loss"
+        ),
     }
 
-    with open(output_dir / "distillation_config.json", "w", encoding="utf-8") as f:
+    with (output_dir / "distillation_config.json").open(
+        "w", encoding="utf-8"
+    ) as f:
         json.dump(config, f, indent=2)
 
-    results = {}
-    all_metric_rows = []
-
-    for dataset_name, folder_name in DATASETS.items():
-        dataset_dir = preprocessing_dir / folder_name
-
-        result = run_dataset(
-            dataset_name,
-            dataset_dir,
-            output_dir,
-        )
-
-        results[dataset_name] = result
-        all_metric_rows.extend(result["metric_rows"])
-
-    metrics_df = pd.DataFrame(all_metric_rows)
-
-    float_cols = [
-        "accuracy",
-        "precision",
-        "recall",
-        "f1",
-        "false_negative_rate",
-        "false_positive_rate",
-        "roc_auc",
-    ]
-
-    for col in float_cols:
-        metrics_df[col] = metrics_df[col].map(lambda x: f"{x:.8f}")
-
-    metrics_df.to_csv(
-        output_dir / "distillation_metrics.csv",
-        index=False,
-    )
-
-    with open(output_dir / "distillation_results.json", "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "config": config,
-                "results": results,
-            },
-            f,
-            indent=2,
-        )
-
+    all_results = []
     artifact_hashes = {}
+
+    for dataset in args.datasets:
+        log(f"Distilling DNN for {dataset}")
+
+        dataset_key = dataset.lower().replace("-", "_")
+        preprocessing_dataset_dir = preprocessing_dir / dataset_key
+        baseline_dataset_dir = baseline_dir / dataset_key
+        dataset_output_dir = output_dir / dataset_key
+        dataset_output_dir.mkdir(parents=True, exist_ok=True)
+
+        required_files = [
+            "X_train.npy",
+            "X_validation.npy",
+            "X_test.npy",
+            "y_train.npy",
+            "y_validation.npy",
+            "y_test.npy",
+            "feature_names.json",
+        ]
+
+        for filename in required_files:
+            path = preprocessing_dataset_dir / filename
+            if not path.exists():
+                fail(f"Required preprocessing artifact not found: {path}")
+
+        X_train = np.load(preprocessing_dataset_dir / "X_train.npy")
+        X_validation = np.load(preprocessing_dataset_dir / "X_validation.npy")
+        X_test = np.load(preprocessing_dataset_dir / "X_test.npy")
+
+        y_train = np.load(preprocessing_dataset_dir / "y_train.npy").astype(np.int8)
+        y_validation = np.load(
+            preprocessing_dataset_dir / "y_validation.npy"
+        ).astype(np.int8)
+        y_test = np.load(preprocessing_dataset_dir / "y_test.npy").astype(np.int8)
+
+        feature_schema = load_json(
+            preprocessing_dataset_dir / "feature_names.json"
+        )
+        feature_names = feature_schema["ordered_model_input_features"]
+
+        excluded_annotation_columns = set(
+            feature_schema.get("excluded_annotation_columns", [])
+        )
+
+        if excluded_annotation_columns != REQUIRED_ANNOTATION_EXCLUSIONS:
+            fail(
+                f"{dataset}: preprocessing schema does not confirm required "
+                "annotation-column exclusions."
+            )
+
+        leaked_columns = sorted(
+            set(feature_names).intersection(REQUIRED_ANNOTATION_EXCLUSIONS)
+        )
+
+        if leaked_columns:
+            fail(
+                f"{dataset}: leaked annotation columns found in model inputs: "
+                f"{leaked_columns}"
+            )
+
+        if X_train.shape[1] != len(feature_names):
+            fail(
+                f"{dataset}: X_train has {X_train.shape[1]} features, "
+                f"but feature schema has {len(feature_names)}."
+            )
+
+        teacher_checkpoint = baseline_dataset_dir / "dnn_baseline.pt"
+        teacher = load_teacher(
+            teacher_checkpoint,
+            X_train.shape[1],
+            device,
+        )
+
+        soft_targets = generate_soft_targets(teacher, X_train, device)
+
+        student_checkpoint = dataset_output_dir / "dnn_distilled.pt"
+        student, history = train_student(
+            X_train,
+            y_train,
+            soft_targets,
+            X_validation,
+            y_validation,
+            X_train.shape[1],
+            device,
+            student_checkpoint,
+        )
+
+        validation_pred, validation_score = predict(
+            student, X_validation, device
+        )
+        test_pred, test_score = predict(student, X_test, device)
+
+        validation_metrics = compute_metrics(
+            y_validation, validation_pred, validation_score
+        )
+        test_metrics = compute_metrics(y_test, test_pred, test_score)
+
+        np.savez_compressed(
+            dataset_output_dir / "predictions.npz",
+            validation_predictions=validation_pred,
+            validation_scores=validation_score,
+            test_predictions=test_pred,
+            test_scores=test_score,
+        )
+
+        result = {
+            "dataset": dataset,
+            "model": "distilled_dnn",
+            "random_state": SEED,
+            "train_records": int(len(X_train)),
+            "validation_records": int(len(X_validation)),
+            "test_records": int(len(X_test)),
+            "input_features": int(X_train.shape[1]),
+            "teacher_checkpoint": str(
+                teacher_checkpoint.relative_to(baseline_dir)
+            ),
+            "student_checkpoint": str(
+                student_checkpoint.relative_to(output_dir)
+            ),
+            "student_history": history,
+            "validation_metrics": validation_metrics,
+            "test_metrics": test_metrics,
+        }
+
+        all_results.append(result)
+
+        print(f"\n{dataset} | Defensively distilled DNN")
+        print("Validation:")
+        print(format_metrics(validation_metrics))
+        print("Test:")
+        print(format_metrics(test_metrics))
 
     for path in sorted(output_dir.rglob("*")):
         if path.is_file():
             artifact_hashes[str(path.relative_to(output_dir))] = sha256_file(path)
 
-    with open(output_dir / "artifact_hashes.json", "w", encoding="utf-8") as f:
-        json.dump(artifact_hashes, f, indent=2)
+    results_path = output_dir / "distillation_results.json"
+    metrics_csv_path = output_dir / "distillation_metrics.csv"
 
-    excel_path = output_dir / "Thesis_Distillation_Run_Record.xlsx"
+    metrics_rows = []
 
-    with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-        metrics_df.to_excel(
-            writer,
-            sheet_name="Distilled Metrics",
-            index=False,
+    for result in all_results:
+        for split in ["validation_metrics", "test_metrics"]:
+            metrics_rows.append(
+                {
+                    "dataset": result["dataset"],
+                    "model": result["model"],
+                    "split": split.replace("_metrics", ""),
+                    **result[split],
+                }
+            )
+
+    pd.DataFrame(metrics_rows).to_csv(metrics_csv_path, index=False)
+
+    excel_path = write_workbook(
+        output_dir=output_dir,
+        all_results=all_results,
+        artifact_hashes=artifact_hashes,
+        config=config,
+    )
+    log(f"Wrote distillation run-record workbook: {excel_path}")
+
+    final_report = {
+        "script": "09_defensive_distillation",
+        "started_utc": started_utc,
+        "finished_utc": utc_now().isoformat(),
+        "config": config,
+        "results": all_results,
+        "artifact_hashes": artifact_hashes,
+        "excel_workbook": str(excel_path),
+        "distillation_completed": True,
+        "ready_for_attack_evaluation": True,
+    }
+
+    with results_path.open("w", encoding="utf-8") as f:
+        json.dump(final_report, f, indent=2)
+
+    report_hash = sha256_file(results_path)
+    final_report["distillation_results_sha256"] = report_hash
+
+    with results_path.open("w", encoding="utf-8") as f:
+        json.dump(final_report, f, indent=2)
+
+    print("\n============ 09 DISTILLATION SUMMARY ============")
+
+    for result in all_results:
+        print(
+            f"\n{result['dataset']} | Distilled DNN | "
+            f"Test accuracy: {result['test_metrics']['accuracy']:.8f} | "
+            f"Test F1: {result['test_metrics']['f1']:.8f} | "
+            f"Test FPR: {result['test_metrics']['false_positive_rate']:.8f} | "
+            f"Test FNR: {result['test_metrics']['false_negative_rate']:.8f}"
         )
 
-        pd.DataFrame([config]).to_excel(
-            writer,
-            sheet_name="Run Configuration",
-            index=False,
-        )
-
-        pd.DataFrame(
-            [
-                {"artifact": k, "sha256": v}
-                for k, v in artifact_hashes.items()
-            ]
-        ).to_excel(
-            writer,
-            sheet_name="Artifact Hashes",
-            index=False,
-        )
-
-    print("\n" + "=" * 70)
-    print("DEFENSIVE DISTILLATION COMPLETE")
-    print("=" * 70)
-
-    for dataset_name in DATASETS:
-        test_metrics = results[dataset_name]["test_metrics"]
-
-        print(f"\n{dataset_name} distilled DNN test metrics:")
-        for col in float_cols:
-            print(f"  {col}: {test_metrics[col]:.8f}")
-
-    print("\nSaved outputs:")
-    print(f"  {output_dir}")
-    print("\nDone.")
+    print("\n=================================================")
+    print("[PASS] 09_defensive_distillation completed successfully.")
+    print(f"Results: {results_path}")
+    print(f"Metrics CSV: {metrics_csv_path}")
+    print(f"Excel run record: {excel_path}")
+    print(f"Output folder: {output_dir}")
 
 
 if __name__ == "__main__":

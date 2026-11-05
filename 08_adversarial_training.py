@@ -34,32 +34,14 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 
-# ---------------------------------------------------------------------------
-# CONFIGURATION
-# ---------------------------------------------------------------------------
-
 PROJECT_ROOT = Path(r"E:\Thesis")
 
-PREPROCESSING_DIR = (
-    PROJECT_ROOT
-    / "reports"
-    / "preprocessing"
-    / "preprocessing_20261104T040755_364187Z"
-)
-
-BASELINE_DIR = (
-    PROJECT_ROOT
-    / "reports"
-    / "baselines"
-    / "baselines_20261104T043514_850585Z"
-)
-
+PREPROCESSING_ROOT = PROJECT_ROOT / "reports" / "preprocessing"
+BASELINE_ROOT = PROJECT_ROOT / "reports" / "baselines"
 OUTPUT_ROOT = PROJECT_ROOT / "reports" / "adversarial_training"
 
 RANDOM_STATE = 42
 
-# PGD adversarial-training settings.
-# Values operate in the standardized feature space.
 PGD_EPSILON = 0.10
 PGD_ALPHA = 0.02
 PGD_STEPS = 10
@@ -73,11 +55,8 @@ PATIENCE = 5
 DNN_HIDDEN_DIMS = (256, 128, 64)
 
 DATASETS = ["NSL-KDD", "CICIDS2017"]
+REQUIRED_ANNOTATION_EXCLUSIONS = {"difficulty", "Attempted Category"}
 
-
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -117,6 +96,87 @@ def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def resolve_preprocessing_dir(explicit_dir: str | None) -> Path:
+    if explicit_dir:
+        selected = Path(explicit_dir)
+        if not selected.is_absolute():
+            selected = PROJECT_ROOT / selected
+    else:
+        candidates = sorted(
+            [p for p in PREPROCESSING_ROOT.glob("preprocessing_*") if p.is_dir()],
+            key=lambda p: p.name,
+        )
+        if not candidates:
+            fail(f"No preprocessing folders found under: {PREPROCESSING_ROOT}")
+        selected = candidates[-1]
+
+    report = load_json(selected / "preprocessing_report.json")
+
+    if not report.get("preprocessing_completed", False):
+        fail(f"Selected preprocessing folder is not completed: {selected}")
+
+    if not report.get("ready_for_model_training", False):
+        fail(f"Selected preprocessing folder is not ready for training: {selected}")
+
+    excluded = set(
+        report.get("configuration", {}).get("annotation_excluded_columns", [])
+    )
+
+    if excluded != REQUIRED_ANNOTATION_EXCLUSIONS:
+        fail(
+            "Selected preprocessing output does not exclude required annotation "
+            f"columns.\nFolder: {selected}\nExcluded: {sorted(excluded)}"
+        )
+
+    log(f"Using preprocessing output: {selected}")
+    return selected
+
+
+def resolve_baseline_dir(
+    explicit_dir: str | None,
+    preprocessing_dir: Path,
+    preprocessing_hash: str | None,
+) -> Path:
+    if explicit_dir:
+        selected = Path(explicit_dir)
+        if not selected.is_absolute():
+            selected = PROJECT_ROOT / selected
+    else:
+        candidates = sorted(
+            [p for p in BASELINE_ROOT.glob("baselines_*") if p.is_dir()],
+            key=lambda p: p.name,
+        )
+        if not candidates:
+            fail(f"No baseline folders found under: {BASELINE_ROOT}")
+        selected = candidates[-1]
+
+    report_path = selected / "baseline_results.json"
+    if not report_path.exists():
+        fail(f"Selected baseline folder has no results report: {report_path}")
+
+    report = load_json(report_path)
+
+    if not report.get("baselines_completed", False):
+        fail(f"Selected baseline folder is not completed: {selected}")
+
+    if report.get("preprocessing_dir") != str(preprocessing_dir):
+        fail(
+            "Selected baseline folder was not trained on the selected "
+            "preprocessing output.\n"
+            f"Baseline preprocessing: {report.get('preprocessing_dir')}\n"
+            f"Selected preprocessing:  {preprocessing_dir}"
+        )
+
+    if preprocessing_hash and report.get("preprocessing_report_sha256") != preprocessing_hash:
+        fail(
+            "Baseline preprocessing hash does not match the selected "
+            "preprocessing report hash."
+        )
+
+    log(f"Using baseline output: {selected}")
+    return selected
+
+
 def compute_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
@@ -154,10 +214,6 @@ def format_metrics(metrics: dict) -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# Model and PGD
-# ---------------------------------------------------------------------------
-
 class BaselineDNN(nn.Module):
     def __init__(self, input_dim: int, hidden_dims: tuple[int, ...]):
         super().__init__()
@@ -184,15 +240,29 @@ class BaselineDNN(nn.Module):
 
 def load_clean_dnn(
     checkpoint_path: Path,
+    expected_input_dim: int,
     device: torch.device,
 ) -> BaselineDNN:
     if not checkpoint_path.exists():
         fail(f"Clean baseline DNN checkpoint not found: {checkpoint_path}")
 
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=device,
+        weights_only=False,
+    )
+
+    if int(checkpoint["input_dim"]) != expected_input_dim:
+        fail(
+            "Baseline checkpoint input dimension does not match preprocessing "
+            "features.\n"
+            f"Checkpoint input dim: {checkpoint['input_dim']}\n"
+            f"Expected input dim:   {expected_input_dim}\n"
+            f"Checkpoint: {checkpoint_path}"
+        )
 
     model = BaselineDNN(
-        checkpoint["input_dim"],
+        int(checkpoint["input_dim"]),
         tuple(checkpoint["hidden_dims"]),
     ).to(device)
 
@@ -209,6 +279,9 @@ def pgd_attack(
     steps: int,
 ) -> torch.Tensor:
     """Untargeted PGD attack in the standardized feature space."""
+
+    was_training = model.training
+    model.eval()
 
     X_adv = X.clone().detach()
     X_adv = X_adv + torch.empty_like(X_adv).uniform_(-epsilon, epsilon)
@@ -230,6 +303,9 @@ def pgd_attack(
             X_adv = X_adv + alpha * gradient.sign()
             X_adv = torch.clamp(X_adv, X - epsilon, X + epsilon)
 
+    if was_training:
+        model.train()
+
     return X_adv.detach()
 
 
@@ -250,10 +326,7 @@ def train_adversarial_dnn(
     X_validation_tensor = torch.tensor(X_validation, dtype=torch.float32)
     y_validation_tensor = torch.tensor(y_validation, dtype=torch.float32)
 
-    train_dataset = torch.utils.data.TensorDataset(
-        X_train_tensor,
-        y_train_tensor,
-    )
+    train_dataset = torch.utils.data.TensorDataset(X_train_tensor, y_train_tensor)
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=PGD_BATCH_SIZE,
@@ -266,7 +339,6 @@ def train_adversarial_dnn(
         DNN_HIDDEN_DIMS,
     ).to(device)
 
-    # Start from the clean baseline weights.
     model.load_state_dict(clean_model.state_dict())
 
     criterion = nn.BCEWithLogitsLoss()
@@ -388,16 +460,11 @@ def predict(
     return predictions, scores
 
 
-# ---------------------------------------------------------------------------
-# Excel record
-# ---------------------------------------------------------------------------
-
 def write_adversarial_workbook(
     output_dir: Path,
     all_results: list[dict],
     artifact_hashes: dict[str, str],
     preprocessing_hash: str | None,
-    baseline_dir: Path,
 ) -> Path:
     excel_path = output_dir / "Thesis_Adversarial_Training_Run_Record.xlsx"
 
@@ -432,60 +499,30 @@ def write_adversarial_workbook(
         )
 
         for split in ["validation_metrics", "test_metrics"]:
-            metrics = result[split]
-
             metric_rows.append(
                 {
                     "Run ID": run_id,
                     "Dataset": result["dataset"],
                     "Model": "Adversarially trained DNN",
                     "Split": split.replace("_metrics", ""),
-                    "Accuracy": metrics["accuracy"],
-                    "Precision": metrics["precision"],
-                    "Recall": metrics["recall"],
-                    "Specificity": metrics["specificity"],
-                    "FPR": metrics["fpr"],
-                    "FNR": metrics["fnr"],
-                    "F1-Score": metrics["f1"],
-                    "ROC-AUC": metrics["roc_auc"],
-                    "TP": metrics["tp"],
-                    "FP": metrics["fp"],
-                    "TN": metrics["tn"],
-                    "FN": metrics["fn"],
+                    **result[split],
                 }
             )
 
     for artifact, artifact_hash in sorted(artifact_hashes.items()):
-        hash_rows.append(
-            {
-                "Artifact": artifact,
-                "SHA-256": artifact_hash,
-            }
-        )
+        hash_rows.append({"Artifact": artifact, "SHA-256": artifact_hash})
 
     with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-        pd.DataFrame(run_rows).to_excel(
-            writer,
-            sheet_name="Run Index",
-            index=False,
-        )
+        pd.DataFrame(run_rows).to_excel(writer, sheet_name="Run Index", index=False)
         pd.DataFrame(metric_rows).to_excel(
-            writer,
-            sheet_name="Clean Metrics",
-            index=False,
+            writer, sheet_name="Clean Metrics", index=False
         )
         pd.DataFrame(hash_rows).to_excel(
-            writer,
-            sheet_name="Artifact Hashes",
-            index=False,
+            writer, sheet_name="Artifact Hashes", index=False
         )
 
     return excel_path
 
-
-# ---------------------------------------------------------------------------
-# Main workflow
-# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -498,35 +535,37 @@ def main() -> None:
         choices=DATASETS,
         help="Datasets to train",
     )
+    parser.add_argument(
+        "--preprocessing-dir",
+        type=str,
+        default=None,
+        help="Optional specific 06 preprocessing output folder",
+    )
+    parser.add_argument(
+        "--baseline-dir",
+        type=str,
+        default=None,
+        help="Optional specific 07 baseline output folder",
+    )
     args = parser.parse_args()
 
     started_utc = utc_now()
     log("Starting 08_adversarial_training")
 
-    if not PREPROCESSING_DIR.exists():
-        fail(f"06_preprocess_and_audit output folder not found: {PREPROCESSING_DIR}")
-
-    if not BASELINE_DIR.exists():
-        fail(f"07_train_baselines output folder not found: {BASELINE_DIR}")
-
+    preprocessing_dir = resolve_preprocessing_dir(args.preprocessing_dir)
     preprocessing_report = load_json(
-        PREPROCESSING_DIR / "preprocessing_report.json"
+        preprocessing_dir / "preprocessing_report.json"
     )
-
-    if not preprocessing_report.get("preprocessing_completed", False):
-        fail("06_preprocess_and_audit report is not marked preprocessing_completed.")
-
-    if not preprocessing_report.get("ready_for_model_training", False):
-        fail(
-            "06_preprocess_and_audit report is not marked ready_for_model_training."
-        )
-
-    baseline_report = load_json(BASELINE_DIR / "baseline_results.json")
-
-    if not baseline_report.get("baselines_completed", False):
-        fail("07_train_baselines report is not marked baselines_completed.")
-
     preprocessing_hash = preprocessing_report.get("preprocessing_report_sha256")
+
+    if not preprocessing_hash:
+        fail("Preprocessing report does not contain preprocessing_report_sha256.")
+
+    baseline_dir = resolve_baseline_dir(
+        args.baseline_dir,
+        preprocessing_dir,
+        preprocessing_hash,
+    )
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
     output_dir = OUTPUT_ROOT / f"adversarial_training_{timestamp}"
@@ -542,8 +581,8 @@ def main() -> None:
         log(f"Training adversarial DNN for {dataset}")
 
         dataset_key = dataset.lower().replace("-", "_")
-        preprocessing_dataset_dir = PREPROCESSING_DIR / dataset_key
-        baseline_dataset_dir = BASELINE_DIR / dataset_key
+        preprocessing_dataset_dir = preprocessing_dir / dataset_key
+        baseline_dataset_dir = baseline_dir / dataset_key
         dataset_output_dir = output_dir / dataset_key
         dataset_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -554,6 +593,7 @@ def main() -> None:
             "y_train.npy",
             "y_validation.npy",
             "y_test.npy",
+            "feature_names.json",
         ]
 
         for filename in required_files:
@@ -571,12 +611,43 @@ def main() -> None:
         ).astype(np.int8)
         y_test = np.load(preprocessing_dataset_dir / "y_test.npy").astype(np.int8)
 
-        clean_checkpoint = (
-            baseline_dataset_dir
-            / "dnn_baseline.pt"
+        feature_schema = load_json(
+            preprocessing_dataset_dir / "feature_names.json"
+        )
+        feature_names = feature_schema["ordered_model_input_features"]
+
+        excluded_annotation_columns = set(
+            feature_schema.get("excluded_annotation_columns", [])
         )
 
-        clean_model = load_clean_dnn(clean_checkpoint, device)
+        if excluded_annotation_columns != REQUIRED_ANNOTATION_EXCLUSIONS:
+            fail(
+                f"{dataset}: preprocessing schema does not confirm required "
+                "annotation-column exclusions."
+            )
+
+        leaked_columns = sorted(
+            set(feature_names).intersection(REQUIRED_ANNOTATION_EXCLUSIONS)
+        )
+
+        if leaked_columns:
+            fail(
+                f"{dataset}: leaked annotation columns found in model inputs: "
+                f"{leaked_columns}"
+            )
+
+        if X_train.shape[1] != len(feature_names):
+            fail(
+                f"{dataset}: X_train has {X_train.shape[1]} features, "
+                f"but feature schema has {len(feature_names)}."
+            )
+
+        clean_checkpoint = baseline_dataset_dir / "dnn_baseline.pt"
+        clean_model = load_clean_dnn(
+            clean_checkpoint,
+            X_train.shape[1],
+            device,
+        )
 
         adversarial_checkpoint = dataset_output_dir / "dnn_adversarial.pt"
 
@@ -591,26 +662,14 @@ def main() -> None:
         )
 
         validation_pred, validation_score = predict(
-            model,
-            X_validation,
-            device,
+            model, X_validation, device
         )
-        test_pred, test_score = predict(
-            model,
-            X_test,
-            device,
-        )
+        test_pred, test_score = predict(model, X_test, device)
 
         validation_metrics = compute_metrics(
-            y_validation,
-            validation_pred,
-            validation_score,
+            y_validation, validation_pred, validation_score
         )
-        test_metrics = compute_metrics(
-            y_test,
-            test_pred,
-            test_score,
-        )
+        test_metrics = compute_metrics(y_test, test_pred, test_score)
 
         np.savez_compressed(
             dataset_output_dir / "predictions.npz",
@@ -628,7 +687,7 @@ def main() -> None:
             "validation_records": int(len(X_validation)),
             "test_records": int(len(X_test)),
             "input_features": int(X_train.shape[1]),
-            "clean_checkpoint": str(clean_checkpoint.relative_to(BASELINE_DIR)),
+            "clean_checkpoint": str(clean_checkpoint.relative_to(baseline_dir)),
             "checkpoint": str(adversarial_checkpoint.relative_to(output_dir)),
             "pgd_epsilon": PGD_EPSILON,
             "pgd_alpha": PGD_ALPHA,
@@ -657,13 +716,14 @@ def main() -> None:
 
     for result in all_results:
         for split in ["validation_metrics", "test_metrics"]:
-            row = {
-                "dataset": result["dataset"],
-                "model": result["model"],
-                "split": split.replace("_metrics", ""),
-                **result[split],
-            }
-            metrics_rows.append(row)
+            metrics_rows.append(
+                {
+                    "dataset": result["dataset"],
+                    "model": result["model"],
+                    "split": split.replace("_metrics", ""),
+                    **result[split],
+                }
+            )
 
     pd.DataFrame(metrics_rows).to_csv(metrics_csv_path, index=False)
 
@@ -672,7 +732,6 @@ def main() -> None:
         all_results=all_results,
         artifact_hashes=artifact_hashes,
         preprocessing_hash=preprocessing_hash,
-        baseline_dir=BASELINE_DIR,
     )
     log(f"Wrote adversarial-training run-record workbook: {excel_path}")
 
@@ -680,9 +739,9 @@ def main() -> None:
         "script": "08_adversarial_training",
         "started_utc": started_utc,
         "finished_utc": utc_now(),
-        "preprocessing_dir": str(PREPROCESSING_DIR),
+        "preprocessing_dir": str(preprocessing_dir),
         "preprocessing_report_sha256": preprocessing_hash,
-        "baseline_dir": str(BASELINE_DIR),
+        "baseline_dir": str(baseline_dir),
         "random_state": RANDOM_STATE,
         "datasets": args.datasets,
         "pgd_epsilon": PGD_EPSILON,

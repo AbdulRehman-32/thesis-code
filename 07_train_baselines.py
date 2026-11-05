@@ -36,21 +36,8 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 
-# ---------------------------------------------------------------------------
-# CONFIGURATION
-# ---------------------------------------------------------------------------
-
 PROJECT_ROOT = Path(r"E:\Thesis")
-
-PREPROCESSING_DIR = (
-    PROJECT_ROOT
-    / "reports"
-    / "preprocessing"
-    / "preprocessing_20261104T040755_364187Z"
-)
-
-PREPROCESSING_REPORT = PREPROCESSING_DIR / "preprocessing_report.json"
-
+PREPROCESSING_ROOT = PROJECT_ROOT / "reports" / "preprocessing"
 OUTPUT_ROOT = PROJECT_ROOT / "reports" / "baselines"
 
 RANDOM_STATE = 42
@@ -66,11 +53,8 @@ DNN_PATIENCE = 10
 DNN_HIDDEN_DIMS = (256, 128, 64)
 
 DATASETS = ["NSL-KDD", "CICIDS2017"]
+REQUIRED_ANNOTATION_EXCLUSIONS = {"difficulty", "Attempted Category"}
 
-
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -108,6 +92,46 @@ def set_seed(seed: int) -> None:
 
 def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def resolve_preprocessing_dir(explicit_dir: str | None) -> Path:
+    if explicit_dir:
+        selected = Path(explicit_dir)
+        if not selected.is_absolute():
+            selected = PROJECT_ROOT / selected
+    else:
+        candidates = sorted(
+            [p for p in PREPROCESSING_ROOT.glob("preprocessing_*") if p.is_dir()],
+            key=lambda p: p.name,
+        )
+        if not candidates:
+            fail(f"No preprocessing output folders found under: {PREPROCESSING_ROOT}")
+        selected = candidates[-1]
+
+    report_path = selected / "preprocessing_report.json"
+    if not report_path.exists():
+        fail(f"Selected preprocessing folder has no report: {report_path}")
+
+    report = load_json(report_path)
+
+    if not report.get("preprocessing_completed", False):
+        fail(f"Selected preprocessing folder is not completed: {selected}")
+
+    if not report.get("ready_for_model_training", False):
+        fail(f"Selected preprocessing folder is not ready for training: {selected}")
+
+    excluded = set(
+        report.get("configuration", {}).get("annotation_excluded_columns", [])
+    )
+
+    if excluded != REQUIRED_ANNOTATION_EXCLUSIONS:
+        fail(
+            "Selected preprocessing output does not exclude required annotation "
+            f"columns.\nFolder: {selected}\nExcluded: {sorted(excluded)}"
+        )
+
+    log(f"Using preprocessing output: {selected}")
+    return selected
 
 
 def compute_metrics(
@@ -153,8 +177,6 @@ def write_results_workbook(
     artifact_hashes: dict[str, str],
     preprocessing_hash: str | None,
 ) -> Path:
-    """Create the thesis baseline run-record workbook."""
-
     excel_path = output_dir / "Thesis_Baseline_Run_Record.xlsx"
 
     run_rows = []
@@ -192,18 +214,7 @@ def write_results_workbook(
                     "Dataset": result["dataset"],
                     "Model": result["model"],
                     "Split": split.replace("_metrics", ""),
-                    "Accuracy": metrics["accuracy"],
-                    "Precision": metrics["precision"],
-                    "Recall": metrics["recall"],
-                    "Specificity": metrics["specificity"],
-                    "FPR": metrics["fpr"],
-                    "FNR": metrics["fnr"],
-                    "F1-Score": metrics["f1"],
-                    "ROC-AUC": metrics["roc_auc"],
-                    "TP": metrics["tp"],
-                    "FP": metrics["fp"],
-                    "TN": metrics["tn"],
-                    "FN": metrics["fn"],
+                    **metrics,
                 }
             )
 
@@ -226,41 +237,22 @@ def write_results_workbook(
         )
 
     hash_rows = [
-        {
-            "Artifact": artifact,
-            "SHA-256": artifact_hash,
-        }
+        {"Artifact": artifact, "SHA-256": artifact_hash}
         for artifact, artifact_hash in sorted(artifact_hashes.items())
     ]
 
     with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-        pd.DataFrame(run_rows).to_excel(
-            writer,
-            sheet_name="Run Index",
-            index=False,
-        )
-        pd.DataFrame(metric_rows).to_excel(
-            writer,
-            sheet_name="Metrics",
-            index=False,
-        )
+        pd.DataFrame(run_rows).to_excel(writer, sheet_name="Run Index", index=False)
+        pd.DataFrame(metric_rows).to_excel(writer, sheet_name="Metrics", index=False)
         pd.DataFrame(configuration_rows).to_excel(
-            writer,
-            sheet_name="Configuration",
-            index=False,
+            writer, sheet_name="Configuration", index=False
         )
         pd.DataFrame(hash_rows).to_excel(
-            writer,
-            sheet_name="Artifact Hashes",
-            index=False,
+            writer, sheet_name="Artifact Hashes", index=False
         )
 
     return excel_path
 
-
-# ---------------------------------------------------------------------------
-# DNN
-# ---------------------------------------------------------------------------
 
 class BaselineDNN(nn.Module):
     def __init__(self, input_dim: int, hidden_dims: tuple[int, ...]):
@@ -303,10 +295,7 @@ def train_dnn(
     X_validation_tensor = torch.tensor(X_validation, dtype=torch.float32)
     y_validation_tensor = torch.tensor(y_validation, dtype=torch.float32)
 
-    train_dataset = torch.utils.data.TensorDataset(
-        X_train_tensor,
-        y_train_tensor,
-    )
+    train_dataset = torch.utils.data.TensorDataset(X_train_tensor, y_train_tensor)
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=DNN_BATCH_SIZE,
@@ -416,13 +405,9 @@ def dnn_predict(
     return predictions, scores
 
 
-# ---------------------------------------------------------------------------
-# Main workflow
-# ---------------------------------------------------------------------------
-
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Script 07: clean baseline training from 06_preprocess_and_audit artifacts"
+        description="Script 07: clean baseline training from leakage-free preprocessing artifacts"
     )
     parser.add_argument(
         "--datasets",
@@ -431,40 +416,25 @@ def main() -> None:
         choices=DATASETS,
         help="Datasets to train",
     )
+    parser.add_argument(
+        "--preprocessing-dir",
+        type=str,
+        default=None,
+        help="Optional specific 06 preprocessing output folder; otherwise uses latest valid folder",
+    )
     args = parser.parse_args()
 
     started_utc = utc_now()
     log("Starting 07_train_baselines")
 
-    if not PREPROCESSING_DIR.exists():
-        fail(
-            f"06_preprocess_and_audit output folder not found: {PREPROCESSING_DIR}"
-        )
-
-    preprocessing_report = load_json(PREPROCESSING_REPORT)
-
-    if not preprocessing_report.get("preprocessing_completed", False):
-        fail(
-            "06_preprocess_and_audit report is not marked preprocessing_completed."
-        )
-
-    if not preprocessing_report.get("ready_for_model_training", False):
-        fail(
-            "06_preprocess_and_audit report is not marked ready_for_model_training."
-        )
-
+    preprocessing_dir = resolve_preprocessing_dir(args.preprocessing_dir)
+    preprocessing_report = load_json(
+        preprocessing_dir / "preprocessing_report.json"
+    )
     preprocessing_hash = preprocessing_report.get("preprocessing_report_sha256")
 
-    if preprocessing_hash:
-        log(
-            "06_preprocess_and_audit report self-hash recorded; skipped direct "
-            "file-hash verification because the report contains its own hash."
-        )
-    else:
-        fail(
-            "06_preprocess_and_audit report does not contain "
-            "preprocessing_report_sha256."
-        )
+    if not preprocessing_hash:
+        fail("Preprocessing report does not contain preprocessing_report_sha256.")
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
     output_dir = OUTPUT_ROOT / f"baselines_{timestamp}"
@@ -479,7 +449,7 @@ def main() -> None:
     for dataset in args.datasets:
         log(f"Training baselines for {dataset}")
 
-        dataset_dir = PREPROCESSING_DIR / dataset.lower().replace("-", "_")
+        dataset_dir = preprocessing_dir / dataset.lower().replace("-", "_")
         dataset_output_dir = output_dir / dataset.lower().replace("-", "_")
         dataset_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -508,6 +478,26 @@ def main() -> None:
 
         feature_schema = load_json(dataset_dir / "feature_names.json")
         feature_names = feature_schema["ordered_model_input_features"]
+
+        excluded_annotation_columns = set(
+            feature_schema.get("excluded_annotation_columns", [])
+        )
+
+        if excluded_annotation_columns != REQUIRED_ANNOTATION_EXCLUSIONS:
+            fail(
+                f"{dataset}: feature schema does not confirm required annotation "
+                "column exclusions."
+            )
+
+        leaked_columns = sorted(
+            set(feature_names).intersection(REQUIRED_ANNOTATION_EXCLUSIONS)
+        )
+
+        if leaked_columns:
+            fail(
+                f"{dataset}: leaked annotation columns found in model inputs: "
+                f"{leaked_columns}"
+            )
 
         if X_train.shape[1] != len(feature_names):
             fail(
@@ -559,15 +549,9 @@ def main() -> None:
 
             if model_name == "dnn":
                 validation_pred, validation_score = dnn_predict(
-                    model,
-                    X_validation,
-                    device,
+                    model, X_validation, device
                 )
-                test_pred, test_score = dnn_predict(
-                    model,
-                    X_test,
-                    device,
-                )
+                test_pred, test_score = dnn_predict(model, X_test, device)
             else:
                 validation_pred = model.predict(X_validation).astype(np.int8)
                 validation_score = model.predict_proba(X_validation)[:, 1]
@@ -575,15 +559,9 @@ def main() -> None:
                 test_score = model.predict_proba(X_test)[:, 1]
 
             validation_metrics = compute_metrics(
-                y_validation,
-                validation_pred,
-                validation_score,
+                y_validation, validation_pred, validation_score
             )
-            test_metrics = compute_metrics(
-                y_test,
-                test_pred,
-                test_score,
-            )
+            test_metrics = compute_metrics(y_test, test_pred, test_score)
 
             model_output_dir = dataset_output_dir / model_name
             model_output_dir.mkdir(parents=True, exist_ok=True)
@@ -597,8 +575,7 @@ def main() -> None:
             )
 
             if model_name != "dnn":
-                model_path = model_output_dir / "model.joblib"
-                joblib.dump(model, model_path)
+                joblib.dump(model, model_output_dir / "model.joblib")
 
             result = {
                 "dataset": dataset,
@@ -630,10 +607,11 @@ def main() -> None:
 
         configuration = {
             "dataset": dataset,
-            "preprocessing_dir": str(PREPROCESSING_DIR),
+            "preprocessing_dir": str(preprocessing_dir),
             "preprocessing_report_sha256": preprocessing_hash,
             "feature_count": int(X_train.shape[1]),
             "feature_names": feature_names,
+            "excluded_annotation_columns": sorted(excluded_annotation_columns),
             "random_state": RANDOM_STATE,
             "logistic_regression": {
                 "max_iter": MAX_ITER,
@@ -669,13 +647,14 @@ def main() -> None:
 
     for result in all_results:
         for split in ["validation_metrics", "test_metrics"]:
-            row = {
-                "dataset": result["dataset"],
-                "model": result["model"],
-                "split": split.replace("_metrics", ""),
-                **result[split],
-            }
-            metrics_rows.append(row)
+            metrics_rows.append(
+                {
+                    "dataset": result["dataset"],
+                    "model": result["model"],
+                    "split": split.replace("_metrics", ""),
+                    **result[split],
+                }
+            )
 
     pd.DataFrame(metrics_rows).to_csv(metrics_csv_path, index=False)
 
@@ -691,7 +670,7 @@ def main() -> None:
         "script": "07_train_baselines",
         "started_utc": started_utc,
         "finished_utc": utc_now(),
-        "preprocessing_dir": str(PREPROCESSING_DIR),
+        "preprocessing_dir": str(preprocessing_dir),
         "preprocessing_report_sha256": preprocessing_hash,
         "random_state": RANDOM_STATE,
         "datasets": args.datasets,

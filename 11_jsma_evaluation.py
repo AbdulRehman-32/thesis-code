@@ -9,15 +9,19 @@ Evaluates:
   3. Defensive-distillation DNN
 
 JSMA is computationally expensive, so this script uses a fixed random
-sample of 1,000 test records per dataset.
+sample of 1,000 test records per dataset. The same sample indices are
+used for all three DNN variants.
 
 Usage:
   python 11_jsma_evaluation.py
 """
 
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -35,343 +39,432 @@ from sklearn.metrics import (
 )
 from torch.utils.data import DataLoader, TensorDataset
 
+PROJECT_ROOT = Path(r"E:\Thesis")
+
+PREPROCESSING_ROOT = PROJECT_ROOT / "reports" / "preprocessing"
+BASELINE_ROOT = PROJECT_ROOT / "reports" / "baselines"
+ADVERSARIAL_ROOT = PROJECT_ROOT / "reports" / "adversarial_training"
+DISTILLATION_ROOT = PROJECT_ROOT / "reports" / "distillation"
+OUTPUT_ROOT = PROJECT_ROOT / "reports" / "jsma_evaluation"
+
 SEED = 42
 BATCH_SIZE = 512
-DROPOUT = 0.3
+DROPOUT = 0.2
 
 JSMA_SAMPLES = 1000
 MAX_MODIFIED_FEATURES = 30
 MAX_ITERATIONS = 100
 THETA = 0.1
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-DATASETS = {
-    "NSL-KDD": "nsl_kdd",
-    "CICIDS2017": "cicids2017",
-}
+DATASETS = ["NSL-KDD", "CICIDS2017"]
+REQUIRED_ANNOTATION_EXCLUSIONS = {"difficulty", "Attempted Category"}
 
 
-def utc_now():
+def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def timestamp():
-    return utc_now().strftime("%Y%m%dT%H%M%S_%f")[:-3] + "Z"
+def timestamp() -> str:
+    return utc_now().strftime("%Y%m%dT%H%M%S_%fZ")
 
 
-def sha256_file(path):
+def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
-    with open(path, "rb") as f:
+    with path.open("rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
 
 
-def set_seed(seed=SEED):
+def fail(message: str) -> None:
+    print(f"[FAIL] {message}")
+    sys.exit(1)
+
+
+def log(message: str) -> None:
+    print(f"[INFO] {message}")
+
+
+def load_json(path: Path) -> dict:
+    if not path.exists():
+        fail(f"Required file not found: {path}")
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def set_seed(seed: int = SEED) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
-def find_checkpoint(root, dataset_folder, filename):
-    root = Path(root)
-    matches = list(root.rglob(filename))
+def get_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    dataset_matches = [
-        path for path in matches
-        if dataset_folder.lower() in str(path).lower()
-    ]
 
-    if dataset_matches:
-        return dataset_matches[0]
+def resolve_preprocessing_dir(explicit_dir: str | None) -> Path:
+    if explicit_dir:
+        selected = Path(explicit_dir)
+        if not selected.is_absolute():
+            selected = PROJECT_ROOT / selected
+    else:
+        candidates = sorted(
+            [p for p in PREPROCESSING_ROOT.glob("preprocessing_*") if p.is_dir()],
+            key=lambda p: p.name,
+        )
+        if not candidates:
+            fail(f"No preprocessing folders found under: {PREPROCESSING_ROOT}")
+        selected = candidates[-1]
 
-    if matches:
-        return matches[0]
+    report = load_json(selected / "preprocessing_report.json")
 
-    raise FileNotFoundError(
-        f"Could not find {filename} for {dataset_folder} under {root}"
+    if not report.get("preprocessing_completed", False):
+        fail(f"Selected preprocessing folder is not completed: {selected}")
+
+    excluded = set(
+        report.get("configuration", {}).get("annotation_excluded_columns", [])
     )
 
-
-def load_model(checkpoint_path):
-    checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
-
-    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-        state_dict = checkpoint["state_dict"]
-    else:
-        state_dict = checkpoint
-
-    if any(key.startswith("network.") for key in state_dict):
-        prefix = "network"
-    elif any(key.startswith("net.") for key in state_dict):
-        prefix = "net"
-    else:
-        raise ValueError(
-            f"Could not detect model layer prefix in {checkpoint_path}"
+    if excluded != REQUIRED_ANNOTATION_EXCLUSIONS:
+        fail(
+            "Selected preprocessing output does not exclude required annotation "
+            f"columns.\nFolder: {selected}\nExcluded: {sorted(excluded)}"
         )
 
-    fixed_state_dict = {
-        key.replace(f"{prefix}.", ""): value
-        for key, value in state_dict.items()
-    }
+    log(f"Using preprocessing output: {selected}")
+    return selected
 
-    linear_keys = sorted(
-        [key for key in fixed_state_dict if key.endswith(".weight")],
-        key=lambda key: int(key.split(".")[0]),
+
+def resolve_latest_folder(
+    root: Path,
+    prefix: str,
+    report_filename: str,
+    completed_key: str,
+) -> Path:
+    candidates = sorted(
+        [p for p in root.glob(f"{prefix}_*") if p.is_dir()],
+        key=lambda p: p.name,
     )
 
-    if not linear_keys:
-        raise ValueError(f"No Linear layers found in {checkpoint_path}")
+    if not candidates:
+        fail(f"No {prefix} folders found under: {root}")
 
-    input_dim = fixed_state_dict[linear_keys[0]].shape[1]
-    output_dim = fixed_state_dict[linear_keys[-1]].shape[0]
+    selected = candidates[-1]
+    report = load_json(selected / report_filename)
 
-    hidden_dims = [
-        fixed_state_dict[key].shape[0]
-        for key in linear_keys[:-1]
-    ]
+    if not report.get(completed_key, False):
+        fail(f"Selected {prefix} folder is not completed: {selected}")
 
-    layers = []
-    current_dim = input_dim
-
-    for hidden_dim in hidden_dims:
-        layers.append(nn.Linear(current_dim, hidden_dim))
-        layers.append(nn.ReLU())
-        layers.append(nn.Dropout(DROPOUT))
-        current_dim = hidden_dim
-
-    layers.append(nn.Linear(current_dim, output_dim))
-
-    model = nn.Sequential(*layers).to(DEVICE)
-    model.load_state_dict(fixed_state_dict)
-
-    return model
+    log(f"Using {prefix} output: {selected}")
+    return selected
 
 
-def load_test_data(preprocessing_dir, dataset_folder):
-    dataset_dir = Path(preprocessing_dir) / dataset_folder
-
-    X_test = np.load(dataset_dir / "X_test.npy")
-    y_test = np.load(dataset_dir / "y_test.npy")
-
-    return X_test, y_test
-
-
-def make_loader(X, y):
-    dataset = TensorDataset(
-        torch.tensor(X, dtype=torch.float32),
-        torch.tensor(y, dtype=torch.float32),
+def verify_chain(
+    preprocessing_dir: Path,
+    preprocessing_hash: str | None,
+    baseline_dir: Path,
+    adversarial_dir: Path,
+    distillation_dir: Path,
+) -> None:
+    baseline_report = load_json(baseline_dir / "baseline_results.json")
+    adversarial_report = load_json(
+        adversarial_dir / "adversarial_training_results.json"
+    )
+    distillation_report = load_json(
+        distillation_dir / "distillation_results.json"
     )
 
-    return DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
+    if baseline_report.get("preprocessing_dir") != str(preprocessing_dir):
+        fail("Baseline folder was not trained on the selected preprocessing folder.")
 
-
-def get_loss(logits, y):
-    if logits.shape[1] == 2:
-        return nn.CrossEntropyLoss()(
-            logits,
-            y.long(),
+    if adversarial_report.get("preprocessing_dir") != str(preprocessing_dir):
+        fail(
+            "Adversarial-training folder was not trained on the selected "
+            "preprocessing folder."
         )
 
-    return nn.BCEWithLogitsLoss()(
-        logits.squeeze(1),
-        y.float(),
-    )
+    if distillation_report.get("config", {}).get(
+        "preprocessing_dir"
+    ) != str(preprocessing_dir):
+        fail(
+            "Distillation folder was not trained on the selected preprocessing "
+            "folder."
+        )
+
+    if adversarial_report.get("baseline_dir") != str(baseline_dir):
+        fail("Adversarial-training folder does not match the selected baseline folder.")
+
+    if distillation_report.get("config", {}).get(
+        "baseline_dir"
+    ) != str(baseline_dir):
+        fail("Distillation folder does not match the selected baseline folder.")
+
+    if preprocessing_hash:
+        if baseline_report.get("preprocessing_report_sha256") != preprocessing_hash:
+            fail("Baseline preprocessing hash does not match selected preprocessing.")
+
+        if adversarial_report.get(
+            "preprocessing_report_sha256"
+        ) != preprocessing_hash:
+            fail(
+                "Adversarial-training preprocessing hash does not match selected "
+                "preprocessing."
+            )
+
+        if distillation_report.get("config", {}).get(
+            "preprocessing_report_sha256"
+        ) != preprocessing_hash:
+            fail(
+                "Distillation preprocessing hash does not match selected "
+                "preprocessing."
+            )
 
 
-def get_probabilities(logits):
-    if logits.shape[1] == 2:
-        return torch.softmax(logits, dim=1)[:, 1]
+def compute_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_score: np.ndarray,
+) -> dict:
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
 
-    return torch.sigmoid(logits).squeeze(1)
-
-
-def get_predictions(logits):
-    if logits.shape[1] == 2:
-        return torch.argmax(logits, dim=1)
-
-    return (torch.sigmoid(logits).squeeze(1) >= 0.5).long()
-
-
-def evaluate(model, X, y):
-    model.eval()
-    loader = make_loader(X, y)
-
-    probs, preds, labels = [], [], []
-
-    with torch.no_grad():
-        for xb, yb in loader:
-            logits = model(xb.to(DEVICE))
-            prob = get_probabilities(logits)
-            pred = get_predictions(logits)
-
-            probs.extend(prob.cpu().numpy())
-            preds.extend(pred.cpu().numpy())
-            labels.extend(yb.numpy())
-
-    probs = np.asarray(probs)
-    preds = np.asarray(preds)
-    labels = np.asarray(labels).astype(int)
-
-    tn, fp, fn, tp = confusion_matrix(labels, preds, labels=[0, 1]).ravel()
-
-    metrics = {
-        "accuracy": float(accuracy_score(labels, preds)),
-        "precision": float(precision_score(labels, preds, zero_division=0)),
-        "recall": float(recall_score(labels, preds, zero_division=0)),
-        "f1": float(f1_score(labels, preds, zero_division=0)),
-        "false_negative_rate": float(fn / (tp + fn)) if (tp + fn) else 0.0,
-        "false_positive_rate": float(fp / (fp + tn)) if (fp + tn) else 0.0,
-        "roc_auc": float(roc_auc_score(labels, probs)),
+    return {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+        "specificity": float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0,
+        "false_positive_rate": float(fp / (fp + tn)) if (fp + tn) > 0 else 0.0,
+        "false_negative_rate": float(fn / (fn + tp)) if (fn + tp) > 0 else 0.0,
+        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+        "roc_auc": float(roc_auc_score(y_true, y_score)),
         "tp": int(tp),
         "fp": int(fp),
         "tn": int(tn),
         "fn": int(fn),
     }
 
+
+def format_metrics(metrics: dict) -> str:
+    return (
+        f"Accuracy: {metrics['accuracy']:.8f} | "
+        f"F1: {metrics['f1']:.8f} | "
+        f"FPR: {metrics['false_positive_rate']:.8f} | "
+        f"FNR: {metrics['false_negative_rate']:.8f} | "
+        f"ROC-AUC: {metrics['roc_auc']:.8f}"
+    )
+
+
+class EvaluationDNN(nn.Module):
+    def __init__(self, input_dim: int, hidden_dims: tuple[int, ...]):
+        super().__init__()
+
+        layers = []
+        previous = input_dim
+
+        for hidden in hidden_dims:
+            layers.extend(
+                [
+                    nn.Linear(previous, hidden),
+                    nn.ReLU(),
+                    nn.Dropout(DROPOUT),
+                ]
+            )
+            previous = hidden
+
+        layers.append(nn.Linear(previous, 1))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.network(x).squeeze(-1)
+
+
+def load_model(
+    checkpoint_path: Path,
+    expected_input_dim: int,
+    device: torch.device,
+) -> EvaluationDNN:
+    if not checkpoint_path.exists():
+        fail(f"Checkpoint not found: {checkpoint_path}")
+
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=device,
+        weights_only=False,
+    )
+
+    if int(checkpoint["input_dim"]) != expected_input_dim:
+        fail(
+            "Checkpoint input dimension does not match preprocessing features.\n"
+            f"Checkpoint input dim: {checkpoint['input_dim']}\n"
+            f"Expected input dim:   {expected_input_dim}\n"
+            f"Checkpoint: {checkpoint_path}"
+        )
+
+    model = EvaluationDNN(
+        int(checkpoint["input_dim"]),
+        tuple(checkpoint["hidden_dims"]),
+    ).to(device)
+
+    model.load_state_dict(checkpoint["state_dict"])
+    model.eval()
+    return model
+
+
+def make_loader(X: np.ndarray, y: np.ndarray) -> DataLoader:
+    dataset = TensorDataset(
+        torch.tensor(X, dtype=torch.float32),
+        torch.tensor(y, dtype=torch.float32),
+    )
+    return DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+
+def evaluate(
+    model: EvaluationDNN,
+    X: np.ndarray,
+    y: np.ndarray,
+    device: torch.device,
+) -> tuple[dict, np.ndarray, np.ndarray]:
+    model.eval()
+    loader = make_loader(X, y)
+
+    probs = []
+    preds = []
+    labels = []
+
+    with torch.no_grad():
+        for xb, yb in loader:
+            logits = model(xb.to(device))
+            scores = torch.sigmoid(logits).cpu().numpy()
+            predictions = (scores >= 0.5).astype(np.int8)
+
+            probs.extend(scores)
+            preds.extend(predictions)
+            labels.extend(yb.numpy())
+
+    probs = np.asarray(probs)
+    preds = np.asarray(preds)
+    labels = np.asarray(labels).astype(np.int8)
+
+    metrics = compute_metrics(labels, preds, probs)
     return metrics, probs, preds
 
 
-def jsma_attack_single(model, x, y, input_dim):
-    """
-    Applies JSMA to one sample.
+def jsma_attack_single(
+    model: EvaluationDNN,
+    x_original: np.ndarray,
+    y_true: int,
+    device: torch.device,
+) -> tuple[np.ndarray, int]:
+    """Apply JSMA to one standardized test sample."""
 
-    x: numpy array, shape (input_dim,)
-    y: integer label
-    """
-    x_adv = torch.tensor(x, dtype=torch.float32, device=DEVICE)
-    y_tensor = torch.tensor([y], dtype=torch.float32, device=DEVICE)
+    x_original_tensor = torch.tensor(
+        x_original,
+        dtype=torch.float32,
+        device=device,
+    )
 
-    modified = np.zeros(input_dim, dtype=bool)
+    x_adv = x_original_tensor.clone().detach()
 
     with torch.no_grad():
-        original_logits = model(x_adv.unsqueeze(0))
-        original_pred = get_predictions(original_logits).item()
+        original_logit = model(x_adv.unsqueeze(0)).item()
+        original_prediction = int(original_logit >= 0.0)
 
-    # If the sample is already misclassified, no attack is needed.
-    if original_pred != y:
+    # Already misclassified: no perturbation is required.
+    if original_prediction != y_true:
         return x_adv.cpu().numpy(), 0
+
+    modified = np.zeros(x_original.shape[0], dtype=bool)
+    lower_bound = x_original_tensor - THETA
+    upper_bound = x_original_tensor + THETA
 
     for _ in range(MAX_ITERATIONS):
         if modified.sum() >= MAX_MODIFIED_FEATURES:
             break
 
         x_input = x_adv.clone().detach().unsqueeze(0)
-        x_input.requires_grad = True
+        x_input.requires_grad_(True)
 
-        logits = model(x_input)
+        logit = model(x_input).squeeze()
 
-        current_pred = get_predictions(logits).item()
+        with torch.no_grad():
+            current_prediction = int(logit.item() >= 0.0)
 
-        # Stop if the attack already succeeds.
-        if current_pred != y:
+        if current_prediction != y_true:
             break
 
-        # Choose the target-class logit:
-        # For two-output models, attack the opposite class.
-        # For one-output models, attack the positive-class logit.
-        if logits.shape[1] == 2:
-            target_logit = logits[0, 1 - y]
-        else:
-            target_logit = logits[0, 0]
+        # For a single-output binary model, ascend the positive-class logit
+        # to push the sample toward the attack class.
+        gradient = torch.autograd.grad(logit, x_input)[0].detach().cpu().numpy()[0]
 
-        model.zero_grad()
-
-        if x_input.grad is not None:
-            x_input.grad = None
-
-        target_logit.backward(retain_graph=False)
-
-        target_gradient = x_input.grad.detach().cpu().numpy()[0]
-
-        # Find the unmodified feature with the strongest target-class gradient.
-        best_feature = None
-        best_score = -np.inf
-
-        for feature in range(input_dim):
-            if modified[feature]:
-                continue
-
-            saliency = abs(target_gradient[feature])
-
-            if saliency > best_score:
-                best_score = saliency
-                best_feature = feature
-
-        if best_feature is None:
+        available = np.where(~modified)[0]
+        if available.size == 0:
             break
 
-        # Move the selected feature in the direction that increases the
-        # target-class logit.
-        if target_gradient[best_feature] > 0:
-            x_adv[best_feature] += THETA
-        else:
-            x_adv[best_feature] -= THETA
+        saliency = np.abs(gradient[available])
+        best_feature = int(available[np.argmax(saliency)])
 
-        x_adv = torch.clamp(x_adv, 0.0, 1.0)
+        with torch.no_grad():
+            if gradient[best_feature] >= 0:
+                x_adv[best_feature] += THETA
+            else:
+                x_adv[best_feature] -= THETA
+
+            x_adv = torch.clamp(x_adv, lower_bound, upper_bound)
+
         modified[best_feature] = True
 
         with torch.no_grad():
-            logits = model(x_adv.unsqueeze(0))
-            current_pred = get_predictions(logits).item()
+            adversarial_logit = model(x_adv.unsqueeze(0)).item()
+            adversarial_prediction = int(adversarial_logit >= 0.0)
 
-        if current_pred != y:
+        if adversarial_prediction != y_true:
             break
 
-    return x_adv.detach().cpu().numpy(), int(modified.sum())
+    return x_adv.cpu().numpy(), int(modified.sum())
 
 
-def jsma_attack(model, X, y):
+def jsma_attack(
+    model: EvaluationDNN,
+    X: np.ndarray,
+    y: np.ndarray,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray]:
     model.eval()
 
-    input_dim = X.shape[1]
     X_adv = np.copy(X)
     modified_counts = []
 
-    for i in range(len(X)):
-        X_adv[i], modified = jsma_attack_single(
+    for index in range(len(X)):
+        X_adv[index], modified_count = jsma_attack_single(
             model,
-            X[i],
-            int(y[i]),
-            input_dim,
+            X[index],
+            int(y[index]),
+            device,
         )
-        modified_counts.append(modified)
+        modified_counts.append(modified_count)
 
-        if (i + 1) % 100 == 0:
-            print(f"    JSMA progress: {i + 1}/{len(X)} samples")
+        if (index + 1) % 100 == 0:
+            print(f"    JSMA progress: {index + 1}/{len(X)} samples")
 
     return X_adv, np.asarray(modified_counts)
 
 
-def evaluate_model(model_name, model, X_test, y_test, dataset_name, output_dir):
-    print(f"\nEvaluating {dataset_name} - {model_name}")
-
-    rng = np.random.default_rng(SEED)
-
-    if len(X_test) > JSMA_SAMPLES:
-        sample_indices = rng.choice(
-            len(X_test),
-            size=JSMA_SAMPLES,
-            replace=False,
-        )
-    else:
-        sample_indices = np.arange(len(X_test))
-
-    X_sample = X_test[sample_indices]
-    y_sample = y_test[sample_indices]
+def evaluate_model(
+    model_name: str,
+    model: EvaluationDNN,
+    X_sample: np.ndarray,
+    y_sample: np.ndarray,
+    sample_indices: np.ndarray,
+    dataset_name: str,
+    output_dir: Path,
+    device: torch.device,
+) -> list[dict]:
+    print(f"\nEvaluating {dataset_name} | {model_name}")
 
     clean_metrics, clean_probs, clean_preds = evaluate(
-        model,
-        X_sample,
-        y_sample,
+        model, X_sample, y_sample, device
     )
 
-    print(
-        f"  Clean accuracy: {clean_metrics['accuracy']:.8f} | "
-        f"ROC-AUC: {clean_metrics['roc_auc']:.8f}"
-    )
+    print(f"  Clean | {format_metrics(clean_metrics)}")
 
     np.savez_compressed(
         output_dir / f"{dataset_name}_{model_name}_jsma_clean_predictions.npz",
@@ -387,26 +480,26 @@ def evaluate_model(model_name, model, X_test, y_test, dataset_name, output_dir):
         model,
         X_sample,
         y_sample,
+        device,
     )
 
     adv_metrics, adv_probs, adv_preds = evaluate(
-        model,
-        X_adv,
-        y_sample,
+        model, X_adv, y_sample, device
     )
 
+    print(f"  JSMA  | {format_metrics(adv_metrics)}")
     print(
-        f"  JSMA accuracy: {adv_metrics['accuracy']:.8f} | "
-        f"ROC-AUC: {adv_metrics['roc_auc']:.8f} | "
-        f"mean modified features: {modified_counts.mean():.4f}"
+        f"  Mean modified features: {modified_counts.mean():.4f} | "
+        f"Successful attack rate: "
+        f"{float(np.mean(adv_preds != y_sample)):.8f}"
     )
 
     np.savez_compressed(
-        output_dir / f"{dataset_name}_{model_name}_jsma_adversarial_predictions.npz",
+        output_dir
+        / f"{dataset_name}_{model_name}_jsma_adversarial_predictions.npz",
         y_true=y_sample,
         y_prob=adv_probs,
         y_pred=adv_preds,
-        x_adv=X_adv,
         modified_features=modified_counts,
         sample_indices=sample_indices,
     )
@@ -430,61 +523,143 @@ def evaluate_model(model_name, model, X_test, y_test, dataset_name, output_dir):
     ]
 
 
-def main():
-    parser = argparse.ArgumentParser()
+def write_workbook(
+    output_dir: Path,
+    results: list[dict],
+    checkpoint_paths: dict,
+    config: dict,
+    artifact_hashes: dict[str, str],
+) -> Path:
+    excel_path = output_dir / "Thesis_JSMA_Evaluation_Run_Record.xlsx"
+
+    results_df = pd.DataFrame(results)
+    checkpoint_rows = [
+        {"dataset": dataset, **paths}
+        for dataset, paths in checkpoint_paths.items()
+    ]
+    hash_rows = [
+        {"Artifact": artifact, "SHA-256": artifact_hash}
+        for artifact, artifact_hash in sorted(artifact_hashes.items())
+    ]
+
+    with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+        results_df.to_excel(writer, sheet_name="JSMA Results", index=False)
+        pd.DataFrame(checkpoint_rows).to_excel(
+            writer, sheet_name="Model Checkpoints", index=False
+        )
+        pd.DataFrame([config]).to_excel(
+            writer, sheet_name="Run Configuration", index=False
+        )
+        pd.DataFrame(hash_rows).to_excel(
+            writer, sheet_name="Artifact Hashes", index=False
+        )
+
+    return excel_path
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Script 11: JSMA adversarial evaluation"
+    )
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        default=DATASETS,
+        choices=DATASETS,
+        help="Datasets to evaluate",
+    )
     parser.add_argument(
         "--preprocessing-dir",
-        default=r"E:\Thesis\reports\preprocessing\preprocessing_20261104T040755_364187Z",
+        type=str,
+        default=None,
+        help="Optional specific 06 preprocessing output folder",
     )
     parser.add_argument(
         "--baseline-dir",
-        default=r"E:\Thesis\reports\baselines\baselines_20261104T043514_850585Z",
+        type=str,
+        default=None,
+        help="Optional specific 07 baseline output folder",
     )
     parser.add_argument(
         "--adversarial-dir",
-        default=r"E:\Thesis\reports\adversarial_training\adversarial_training_20261104T051559_260516Z",
+        type=str,
+        default=None,
+        help="Optional specific 08 adversarial-training output folder",
     )
     parser.add_argument(
         "--distillation-dir",
-        default=r"E:\Thesis\reports\distillation\distillation_20261104T070817_076Z",
-    )
-    parser.add_argument(
-        "--output-root",
-        default=r"E:\Thesis\reports\jsma_evaluation",
+        type=str,
+        default=None,
+        help="Optional specific 09 distillation output folder",
     )
     args = parser.parse_args()
 
-    set_seed()
+    started_utc = utc_now().isoformat()
+    log("Starting 11_jsma_evaluation")
 
-    preprocessing_dir = Path(args.preprocessing_dir)
-    baseline_dir = Path(args.baseline_dir)
-    adversarial_dir = Path(args.adversarial_dir)
-    distillation_dir = Path(args.distillation_dir)
+    preprocessing_dir = resolve_preprocessing_dir(args.preprocessing_dir)
+    preprocessing_report = load_json(
+        preprocessing_dir / "preprocessing_report.json"
+    )
+    preprocessing_hash = preprocessing_report.get("preprocessing_report_sha256")
+
+    if not preprocessing_hash:
+        fail("Preprocessing report does not contain preprocessing_report_sha256.")
+
+    baseline_dir = (
+        Path(args.baseline_dir)
+        if args.baseline_dir
+        else resolve_latest_folder(
+            BASELINE_ROOT,
+            "baselines",
+            "baseline_results.json",
+            "baselines_completed",
+        )
+    )
+
+    adversarial_dir = (
+        Path(args.adversarial_dir)
+        if args.adversarial_dir
+        else resolve_latest_folder(
+            ADVERSARIAL_ROOT,
+            "adversarial_training",
+            "adversarial_training_results.json",
+            "adversarial_training_completed",
+        )
+    )
+
+    distillation_dir = (
+        Path(args.distillation_dir)
+        if args.distillation_dir
+        else resolve_latest_folder(
+            DISTILLATION_ROOT,
+            "distillation",
+            "distillation_results.json",
+            "distillation_completed",
+        )
+    )
+
+    verify_chain(
+        preprocessing_dir,
+        preprocessing_hash,
+        baseline_dir,
+        adversarial_dir,
+        distillation_dir,
+    )
 
     run_id = timestamp()
-    output_dir = Path(args.output_root) / f"jsma_evaluation_{run_id}"
+    output_dir = OUTPUT_ROOT / f"jsma_evaluation_{run_id}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("=" * 70)
-    print("SCRIPT 11: JSMA ADVERSARIAL EVALUATION")
-    print("=" * 70)
-    print(f"Device: {DEVICE}")
-    print(f"Preprocessing folder: {preprocessing_dir}")
-    print(f"Baseline folder: {baseline_dir}")
-    print(f"Adversarial folder: {adversarial_dir}")
-    print(f"Distillation folder: {distillation_dir}")
-    print(f"Output folder: {output_dir}")
-    print(f"JSMA sample size: {JSMA_SAMPLES}")
-    print(f"Maximum modified features: {MAX_MODIFIED_FEATURES}")
-    print(f"Maximum iterations: {MAX_ITERATIONS}")
-    print(f"Perturbation step: {THETA}")
+    device = get_device()
+    log(f"Using device: {device}")
 
     config = {
         "script": "11_jsma_evaluation.py",
-        "run_id": run_id,
-        "created_utc": utc_now().isoformat(),
-        "device": str(DEVICE),
+        "started_utc": started_utc,
+        "device": str(device),
         "preprocessing_dir": str(preprocessing_dir),
+        "preprocessing_report_sha256": preprocessing_hash,
         "baseline_dir": str(baseline_dir),
         "adversarial_dir": str(adversarial_dir),
         "distillation_dir": str(distillation_dir),
@@ -495,87 +670,135 @@ def main():
         "batch_size": BATCH_SIZE,
         "seed": SEED,
         "attack": "JSMA",
-        "clamp_range": [0.0, 1.0],
+        "perturbation_constraint": (
+            "Each modified feature remains within plus/minus theta of its "
+            "original standardized value"
+        ),
     }
 
-    with open(output_dir / "jsma_evaluation_config.json", "w", encoding="utf-8") as f:
+    with (output_dir / "jsma_evaluation_config.json").open(
+        "w", encoding="utf-8"
+    ) as f:
         json.dump(config, f, indent=2)
 
     all_rows = []
     checkpoint_paths = {}
 
-    for dataset_name, dataset_folder in DATASETS.items():
-        X_test, y_test = load_test_data(preprocessing_dir, dataset_folder)
+    for dataset in args.datasets:
+        dataset_key = dataset.lower().replace("-", "_")
+        preprocessing_dataset_dir = preprocessing_dir / dataset_key
 
-        baseline_path = find_checkpoint(
-            baseline_dir,
-            dataset_folder,
-            "dnn_baseline.pt",
+        required_files = [
+            "X_test.npy",
+            "y_test.npy",
+            "feature_names.json",
+        ]
+
+        for filename in required_files:
+            path = preprocessing_dataset_dir / filename
+            if not path.exists():
+                fail(f"Required preprocessing artifact not found: {path}")
+
+        X_test = np.load(preprocessing_dataset_dir / "X_test.npy")
+        y_test = np.load(preprocessing_dataset_dir / "y_test.npy").astype(np.int8)
+
+        feature_schema = load_json(
+            preprocessing_dataset_dir / "feature_names.json"
+        )
+        feature_names = feature_schema["ordered_model_input_features"]
+
+        excluded_annotation_columns = set(
+            feature_schema.get("excluded_annotation_columns", [])
         )
 
-        adversarial_path = find_checkpoint(
-            adversarial_dir,
-            dataset_folder,
-            "dnn_adversarial.pt",
+        if excluded_annotation_columns != REQUIRED_ANNOTATION_EXCLUSIONS:
+            fail(
+                f"{dataset}: preprocessing schema does not confirm required "
+                "annotation-column exclusions."
+            )
+
+        leaked_columns = sorted(
+            set(feature_names).intersection(REQUIRED_ANNOTATION_EXCLUSIONS)
         )
 
-        distilled_path = find_checkpoint(
-            distillation_dir,
-            dataset_folder,
-            f"{dataset_folder}_distilled_dnn.pt",
+        if leaked_columns:
+            fail(
+                f"{dataset}: leaked annotation columns found in model inputs: "
+                f"{leaked_columns}"
+            )
+
+        if X_test.shape[1] != len(feature_names):
+            fail(
+                f"{dataset}: X_test has {X_test.shape[1]} features, "
+                f"but feature schema has {len(feature_names)}."
+            )
+
+        rng = np.random.default_rng(SEED)
+
+        if len(X_test) > JSMA_SAMPLES:
+            sample_indices = rng.choice(
+                len(X_test),
+                size=JSMA_SAMPLES,
+                replace=False,
+            )
+        else:
+            sample_indices = np.arange(len(X_test))
+
+        X_sample = X_test[sample_indices]
+        y_sample = y_test[sample_indices]
+
+        baseline_checkpoint = baseline_dir / dataset_key / "dnn_baseline.pt"
+        adversarial_checkpoint = (
+            adversarial_dir / dataset_key / "dnn_adversarial.pt"
+        )
+        distilled_checkpoint = (
+            distillation_dir / dataset_key / "dnn_distilled.pt"
         )
 
-        checkpoint_paths[dataset_name] = {
-            "baseline": str(baseline_path),
-            "adversarial": str(adversarial_path),
-            "distilled": str(distilled_path),
+        checkpoint_paths[dataset] = {
+            "baseline": str(baseline_checkpoint),
+            "adversarial": str(adversarial_checkpoint),
+            "distilled": str(distilled_checkpoint),
         }
 
         models = {
-            "baseline_dnn": baseline_path,
-            "adversarially_trained_dnn": adversarial_path,
-            "distilled_dnn": distilled_path,
+            "baseline_dnn": baseline_checkpoint,
+            "adversarially_trained_dnn": adversarial_checkpoint,
+            "distilled_dnn": distilled_checkpoint,
         }
 
         for model_name, checkpoint_path in models.items():
-            model = load_model(checkpoint_path)
+            model = load_model(
+                checkpoint_path,
+                X_sample.shape[1],
+                device,
+            )
 
             rows = evaluate_model(
                 model_name,
                 model,
-                X_test,
-                y_test,
-                dataset_name,
+                X_sample,
+                y_sample,
+                sample_indices,
+                dataset,
                 output_dir,
+                device,
             )
 
             all_rows.extend(rows)
 
-    results_df = pd.DataFrame(all_rows)
+    artifact_hashes = {}
 
-    float_cols = [
-        "accuracy",
-        "precision",
-        "recall",
-        "f1",
-        "false_negative_rate",
-        "false_positive_rate",
-        "roc_auc",
-        "mean_modified_features",
-    ]
+    for path in sorted(output_dir.rglob("*")):
+        if path.is_file():
+            artifact_hashes[str(path.relative_to(output_dir))] = sha256_file(path)
 
-    for col in float_cols:
-        if col in results_df.columns:
-            results_df[col] = results_df[col].map(
-                lambda x: f"{x:.8f}" if pd.notnull(x) else ""
-            )
+    results_path = output_dir / "jsma_evaluation_results.json"
+    metrics_csv_path = output_dir / "jsma_evaluation_metrics.csv"
 
-    results_df.to_csv(
-        output_dir / "jsma_evaluation_metrics.csv",
-        index=False,
-    )
+    pd.DataFrame(all_rows).to_csv(metrics_csv_path, index=False)
 
-    with open(output_dir / "jsma_evaluation_results.json", "w", encoding="utf-8") as f:
+    with results_path.open("w", encoding="utf-8") as f:
         json.dump(
             {
                 "config": config,
@@ -586,57 +809,70 @@ def main():
             indent=2,
         )
 
-    artifact_hashes = {}
+    report_hash = sha256_file(results_path)
 
-    for path in sorted(output_dir.rglob("*")):
-        if path.is_file():
-            artifact_hashes[str(path.relative_to(output_dir))] = sha256_file(path)
+    final_report = {
+        "script": "11_jsma_evaluation",
+        "started_utc": started_utc,
+        "finished_utc": utc_now().isoformat(),
+        "config": config,
+        "checkpoint_paths": checkpoint_paths,
+        "results": all_rows,
+        "artifact_hashes": artifact_hashes,
+        "excel_workbook": str(
+            output_dir / "Thesis_JSMA_Evaluation_Run_Record.xlsx"
+        ),
+        "jsma_evaluation_completed": True,
+        "jsma_evaluation_results_sha256": report_hash,
+    }
 
-    with open(output_dir / "artifact_hashes.json", "w", encoding="utf-8") as f:
-        json.dump(artifact_hashes, f, indent=2)
+    with results_path.open("w", encoding="utf-8") as f:
+        json.dump(final_report, f, indent=2)
 
-    excel_path = output_dir / "Thesis_JSMA_Evaluation_Run_Record.xlsx"
+    excel_path = write_workbook(
+        output_dir=output_dir,
+        results=all_rows,
+        checkpoint_paths=checkpoint_paths,
+        config=config,
+        artifact_hashes=artifact_hashes,
+    )
+    log(f"Wrote JSMA evaluation run-record workbook: {excel_path}")
 
-    with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-        results_df.to_excel(
-            writer,
-            sheet_name="JSMA Results",
-            index=False,
-        )
+    print("\n============ 11 JSMA EVALUATION SUMMARY ============")
 
-        pd.DataFrame([config]).to_excel(
-            writer,
-            sheet_name="Run Configuration",
-            index=False,
-        )
+    for dataset in args.datasets:
+        dataset_rows = [row for row in all_rows if row["dataset"] == dataset]
 
-        pd.DataFrame(
-            [
-                {"dataset": dataset, **paths}
-                for dataset, paths in checkpoint_paths.items()
+        for model_name in [
+            "baseline_dnn",
+            "adversarially_trained_dnn",
+            "distilled_dnn",
+        ]:
+            model_rows = [
+                row for row in dataset_rows if row["model"] == model_name
             ]
-        ).to_excel(
-            writer,
-            sheet_name="Model Checkpoints",
-            index=False,
-        )
 
-        pd.DataFrame(
-            [
-                {"artifact": artifact, "sha256": digest}
-                for artifact, digest in artifact_hashes.items()
-            ]
-        ).to_excel(
-            writer,
-            sheet_name="Artifact Hashes",
-            index=False,
-        )
+            clean_row = next(
+                row for row in model_rows if row["attack"] == "none"
+            )
+            jsma_row = next(
+                row for row in model_rows if row["attack"] == "JSMA"
+            )
 
-    print("\n" + "=" * 70)
-    print("JSMA EVALUATION COMPLETE")
-    print("=" * 70)
-    print(f"Saved outputs: {output_dir}")
-    print("\nDone.")
+            print(
+                f"\n{dataset} | {model_name}\n"
+                f"  Clean accuracy: {clean_row['accuracy']:.8f}\n"
+                f"  JSMA accuracy: {jsma_row['accuracy']:.8f}\n"
+                f"  Mean modified features: "
+                f"{jsma_row['mean_modified_features']:.4f}"
+            )
+
+    print("\n====================================================")
+    print("[PASS] 11_jsma_evaluation completed successfully.")
+    print(f"Results: {results_path}")
+    print(f"Metrics CSV: {metrics_csv_path}")
+    print(f"Excel run record: {excel_path}")
+    print(f"Output folder: {output_dir}")
 
 
 if __name__ == "__main__":
